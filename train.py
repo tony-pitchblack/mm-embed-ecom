@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from dotenv import load_dotenv
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, recall_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -131,13 +131,20 @@ def evaluation(
     pos_acc = preds[pos_mask].float().mean().item() if pos_mask.any() else 0.0
     neg_acc = (preds[neg_mask] == 0).float().mean().item() if neg_mask.any() else 0.0
     avg_acc = (pos_acc + neg_acc) / 2.0
-    f1 = f1_score((labels.numpy() == 0).astype(int), preds.numpy(), zero_division=0)
-    if mlflow_active and split_name == "val":
+    y_bin = (labels.numpy() == 0).astype(int)
+    pred_bin = preds.numpy()
+    f1 = f1_score(y_bin, pred_bin, zero_division=0)
+    recall = recall_score(y_bin, pred_bin, zero_division=0)
+    if mlflow_active:
+        prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
-        if metric == "f1":
-            mlflow.log_metric("valid_f1_score", f1, step=step)
-        else:
-            mlflow.log_metric("valid_pos_accuracy", pos_acc, step=step)
+        kw = dict(step=step) if split_name == "val" else {}
+        mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
+        mlflow.log_metric(f"{prefix}pos_accuracy", pos_acc, **kw)
+        mlflow.log_metric(f"{prefix}neg_accuracy", neg_acc, **kw)
+        mlflow.log_metric(f"{prefix}accuracy", avg_acc, **kw)
+        mlflow.log_metric(f"{prefix}f1_score", f1, **kw)
+        mlflow.log_metric(f"{prefix}recall", recall, **kw)
     return pos_acc, neg_acc, avg_acc, f1, avg_loss, best_thr
 
 
@@ -414,11 +421,6 @@ def main():
             name_model_name=cfg["name_model_name"],
             description_model_name=cfg["description_model_name"],
         )
-        if mlflow_active:
-            mlflow.log_metric("test_pos_accuracy", test_pos_acc)
-            mlflow.log_metric("test_neg_accuracy", test_neg_acc)
-            mlflow.log_metric("test_accuracy", test_acc)
-            mlflow.log_metric("test_f1_score", test_f1)
         filename = (
             f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_f1-{test_f1:.3f}_pacc-{test_pos_acc:.3f}_nacc-{test_neg_acc:.3f}_"
             f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
