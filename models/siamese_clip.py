@@ -156,9 +156,12 @@ class SiameseRuCLIP(nn.Module):
         return self.head(combined_emb)
 
     def forward(self, im1, name1, desc1, im2, name2, desc2):
-        out1 = self.get_final_embedding(im1, name1, desc1)
-        out2 = self.get_final_embedding(im2, name2, desc2)
-        return out1, out2
+        b = im1.size(0)
+        im = torch.cat([im1, im2], dim=0)
+        name = torch.cat([name1, name2], dim=0)
+        desc = torch.cat([desc1, desc2], dim=0)
+        out = self.get_final_embedding(im, name, desc)
+        return out[:b], out[b:]
 
 
 class ContrastiveLoss(torch.nn.Module):

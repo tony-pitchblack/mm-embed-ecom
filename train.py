@@ -1,6 +1,6 @@
 import argparse
 import os
-from copy import deepcopy
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -80,31 +80,41 @@ def evaluation(
     else:
         tokenizers = None
         transform = None
+    use_amp = device == "cuda"
+    amp_dtype = (
+        torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    )
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=f"eval_{split_name}"):
             if precompute_pairs:
-                im1 = batch["image_first"].to(device)
-                n1 = batch["name_first"].to(device)
-                d1 = batch["desc_first"].to(device)
-                im2 = batch["image_second"].to(device)
-                n2 = batch["name_second"].to(device)
-                d2 = batch["desc_second"].to(device)
-                labels = batch["label"].to(device)
+                im1 = batch["image_first"].to(device, non_blocking=True)
+                n1 = batch["name_first"].to(device, non_blocking=True)
+                d1 = batch["desc_first"].to(device, non_blocking=True)
+                im2 = batch["image_second"].to(device, non_blocking=True)
+                n2 = batch["name_second"].to(device, non_blocking=True)
+                d2 = batch["desc_second"].to(device, non_blocking=True)
+                labels = batch["label"].to(device, non_blocking=True)
             else:
                 sku_first = batch["sku_first"]
                 sku_second = batch["sku_second"]
-                labels = batch["label"].to(device)
+                labels = batch["label"].to(device, non_blocking=True)
                 im1, n1, d1 = sku_to_model_inputs(
                     sku_first.tolist(), source_df, images_dir, tokenizers, transform
                 )
                 im2, n2, d2 = sku_to_model_inputs(
                     sku_second.tolist(), source_df, images_dir, tokenizers, transform
                 )
-                im1, n1, d1 = im1.to(device), n1.to(device), d1.to(device)
-                im2, n2, d2 = im2.to(device), n2.to(device), d2.to(device)
-            out1, out2 = model(im1, n1, d1, im2, n2, d2)
-            total_loss += criterion(out1, out2, labels).item()
-            all_d.append(F.pairwise_distance(out1, out2).cpu())
+                im1 = im1.to(device, non_blocking=True)
+                n1 = n1.to(device, non_blocking=True)
+                d1 = d1.to(device, non_blocking=True)
+                im2 = im2.to(device, non_blocking=True)
+                n2 = n2.to(device, non_blocking=True)
+                d2 = d2.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                out1, out2 = model(im1, n1, d1, im2, n2, d2)
+                loss = criterion(out1, out2, labels)
+            total_loss += loss.item()
+            all_d.append(F.pairwise_distance(out1.float(), out2.float()).cpu())
             all_lbl.append(labels.cpu())
     distances = torch.cat(all_d)
     labels = torch.cat(all_lbl)
@@ -189,6 +199,13 @@ def train_with_threshold_tracking(
         threshold=1e-4,
         threshold_mode="rel",
     )
+    use_amp = device == "cuda"
+    amp_dtype = (
+        torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+    probe_steps = int(os.environ.get("PROBE_STEPS", "0") or "0")
+    probe_step_count = 0
     if models_dir:
         Path(models_dir).mkdir(parents=True, exist_ok=True)
     for epoch in range(1, epochs_num + 1):
@@ -196,31 +213,53 @@ def train_with_threshold_tracking(
         total_train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"train_ep{epoch}"):
             if precompute_pairs:
-                im1 = batch["image_first"].to(device)
-                n1 = batch["name_first"].to(device)
-                d1 = batch["desc_first"].to(device)
-                im2 = batch["image_second"].to(device)
-                n2 = batch["name_second"].to(device)
-                d2 = batch["desc_second"].to(device)
-                labels = batch["label"].to(device)
+                im1 = batch["image_first"].to(device, non_blocking=True)
+                n1 = batch["name_first"].to(device, non_blocking=True)
+                d1 = batch["desc_first"].to(device, non_blocking=True)
+                im2 = batch["image_second"].to(device, non_blocking=True)
+                n2 = batch["name_second"].to(device, non_blocking=True)
+                d2 = batch["desc_second"].to(device, non_blocking=True)
+                labels = batch["label"].to(device, non_blocking=True)
             else:
                 sku_first = batch["sku_first"]
                 sku_second = batch["sku_second"]
-                labels = batch["label"].to(device)
+                labels = batch["label"].to(device, non_blocking=True)
                 im1, n1, d1 = sku_to_model_inputs(
                     sku_first.tolist(), source_df, images_dir, tokenizers, transform
                 )
                 im2, n2, d2 = sku_to_model_inputs(
                     sku_second.tolist(), source_df, images_dir, tokenizers, transform
                 )
-                im1, n1, d1 = im1.to(device), n1.to(device), d1.to(device)
-                im2, n2, d2 = im2.to(device), n2.to(device), d2.to(device)
-            optimizer.zero_grad()
-            out1, out2 = model(im1, n1, d1, im2, n2, d2)
-            loss = criterion(out1, out2, labels)
-            loss.backward()
-            optimizer.step()
+                im1 = im1.to(device, non_blocking=True)
+                n1 = n1.to(device, non_blocking=True)
+                d1 = d1.to(device, non_blocking=True)
+                im2 = im2.to(device, non_blocking=True)
+                n2 = n2.to(device, non_blocking=True)
+                d2 = d2.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                out1, out2 = model(im1, n1, d1, im2, n2, d2)
+                loss = criterion(out1, out2, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_train_loss += loss.item()
+            if probe_steps > 0:
+                probe_step_count += 1
+                if probe_step_count >= probe_steps:
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                        peak_mib = torch.cuda.max_memory_allocated() // (1024 * 1024)
+                        reserved_mib = torch.cuda.max_memory_reserved() // (1024 * 1024)
+                    else:
+                        peak_mib = 0
+                        reserved_mib = 0
+                    print(
+                        f"PROBE_RESULT peak_mib={peak_mib} reserved_mib={reserved_mib} "
+                        f"bs={im1.size(0)}",
+                        flush=True,
+                    )
+                    sys.exit(0)
         train_losses.append(total_train_loss / max(len(train_loader), 1))
         if valid_loader is not None:
             pos_acc, neg_acc, avg_acc, f1_val, val_loss, val_thr = evaluation(
@@ -244,22 +283,22 @@ def train_with_threshold_tracking(
             val_losses.append(val_loss)
             cur_metric = pos_acc if metric == "pos_acc" else f1_val
             scheduler.step(cur_metric)
-            if models_dir:
-                checkpoint_filename = (
-                    f"siamese_contrastive_soft-neg_val_ep{epoch}_f1-{f1_val:.3f}_pacc-{pos_acc:.3f}_nacc-{neg_acc:.3f}_"
-                    f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
-                    f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_thr:.3f}.pt"
-                )
-                sd = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-                torch.save(sd, Path(models_dir) / checkpoint_filename)
             if cur_metric > best_valid_metric:
                 best_valid_metric = cur_metric
                 best_threshold = val_thr
-                best_weights = deepcopy(
+                sd = (
                     model.module.state_dict()
                     if isinstance(model, torch.nn.DataParallel)
                     else model.state_dict()
                 )
+                best_weights = {k: v.detach().cpu().clone() for k, v in sd.items()}
+                if models_dir:
+                    checkpoint_filename = (
+                        f"siamese_contrastive_soft-neg_val_ep{epoch}_f1-{f1_val:.3f}_pacc-{pos_acc:.3f}_nacc-{neg_acc:.3f}_"
+                        f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
+                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_thr:.3f}.pt"
+                    )
+                    torch.save(best_weights, Path(models_dir) / checkpoint_filename)
     return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
 
 
@@ -307,9 +346,15 @@ def main():
     images_dir = str(data_path / cfg["img_dataset_name"])
     results_root = data_path / cfg["results_dir"]
     models_dir_preload = str(results_root)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers = get_optimal_num_workers() if device == "cuda" else 0
-    pin = device == "cuda"
+    device = str(cfg.get("device", "cuda")).lower()
+    if device != "cuda":
+        raise ValueError("Only CUDA is supported. Set device: cuda in config.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available on this machine.")
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    num_workers = get_optimal_num_workers()
+    pin = True
     persistent = num_workers > 0
     limits = {
         "train": cfg["limit_train_pos_pairs_per_query"],
