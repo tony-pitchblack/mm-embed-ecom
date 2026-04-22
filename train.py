@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -17,7 +18,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import PairwiseDataset
+from logging_config import configure_logging
 from models.siamese_clip import ContrastiveLoss, SiameseRuCLIP, Tokenizers, get_transform
+
+logger = logging.getLogger(__name__)
 
 
 def sku_to_model_inputs(sku_list, source_df, images_dir, tokenizers, transform):
@@ -320,11 +324,14 @@ def _processed_root(cfg: dict) -> Path:
 
 def main():
     load_dotenv()
+    configure_logging()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
+    logger.debug("start, config=%s", os.path.abspath(args.config))
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    logger.debug("yaml loaded")
     tracking = os.environ.get("MLFLOW_TRACKING_URI")
     if not tracking:
         host = os.environ.get("MLFLOW_HOST", "127.0.0.1")
@@ -334,15 +341,27 @@ def main():
     if mlflow_active:
         mlflow.set_tracking_uri(tracking)
         mlflow.set_experiment(cfg["mlflow_experiment"])
+        logger.debug("mlflow on, experiment=%s", cfg["mlflow_experiment"])
+    else:
+        logger.debug("mlflow off (set MLFLOW_TRACKING_URI to enable)")
     proc = _processed_root(cfg)
     split_info = f"test={cfg['test_ratio']}_val={cfg['val_ratio']}"
     split_dir = proc / "pairwise-mapping-splits" / split_info
+    logger.debug("split_dir=%s", split_dir)
     for s in ("train", "val", "test"):
         if not (split_dir / f"{s}.parquet").is_file():
             raise FileNotFoundError(f"Missing {split_dir / f'{s}.parquet'}; run prepare_data.py first")
-    splits = {n: pd.read_parquet(split_dir / f"{n}.parquet") for n in ("train", "val", "test")}
+    splits = {}
+    for n in ("train", "val", "test"):
+        p = split_dir / f"{n}.parquet"
+        logger.debug("loading parquet %s … %s", n, p)
+        splits[n] = pd.read_parquet(p)
+        logger.debug("loaded %s: %d rows", n, len(splits[n]))
     data_path = Path(cfg["data_path"])
-    source_df = pd.read_csv(data_path / cfg["source_table"])
+    src_csv = data_path / cfg["source_table"]
+    logger.debug("loading source csv … %s", src_csv)
+    source_df = pd.read_csv(src_csv)
+    logger.debug("loaded source: %d rows, %d columns", len(source_df), source_df.shape[1])
     images_dir = str(data_path / cfg["img_dataset_name"])
     results_root = data_path / cfg["results_dir"]
     models_dir_preload = str(results_root)
@@ -351,10 +370,16 @@ def main():
         raise ValueError("Only CUDA is supported. Set device: cuda in config.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required but not available on this machine.")
+    logger.debug(
+        "cuda: %d device(s), %s",
+        torch.cuda.device_count(),
+        torch.cuda.get_device_name(0),
+    )
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     num_workers = get_optimal_num_workers()
     pin = True
+    logger.debug("DataLoader num_workers=%d, pin_memory=%s", num_workers, pin)
     persistent = num_workers > 0
     limits = {
         "train": cfg["limit_train_pos_pairs_per_query"],
@@ -364,6 +389,7 @@ def main():
     loaders = {}
     train_stats = None
     for split_name in ("train", "val", "test"):
+        logger.debug("PairwiseDataset + DataLoader: split=%r …", split_name)
         ds = PairwiseDataset(
             splits[split_name],
             source_df,
@@ -375,8 +401,16 @@ def main():
             precompute=True,
             name_model_name=cfg["name_model_name"],
             description_model_name=cfg["description_model_name"],
+            pair_gen_split_label=split_name,
         )
         st = ds.get_batch_stats()
+        logger.debug(
+            "dataset %s ready: %d pairs, queries=%d, batch_size=%d",
+            split_name,
+            st["total_pairs"],
+            st["queries"],
+            cfg["batch_size_per_device"],
+        )
         if split_name == "train":
             train_stats = st
         dl_kw = dict(
@@ -390,7 +424,9 @@ def main():
             dl_kw["persistent_workers"] = True
             dl_kw["prefetch_factor"] = 4
         loaders[split_name] = DataLoader(ds, **dl_kw)
+        logger.debug("DataLoader %s: %d batches/epoch", split_name, len(loaders[split_name]))
     num_gpus = torch.cuda.device_count()
+    logger.debug("building SiameseRuCLIP (download/load weights if needed) …")
     model = SiameseRuCLIP(
         device,
         cfg["name_model_name"],
@@ -399,6 +435,7 @@ def main():
         models_dir_preload,
         cfg.get("dropout"),
     )
+    logger.debug("SiameseRuCLIP built")
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)
@@ -410,6 +447,11 @@ def main():
     try:
         if mlflow_active:
             mlflow.log_params({k: str(v) for k, v in cfg.items() if isinstance(v, (int, float, str))})
+        logger.debug(
+            "entering training: epochs=%d, best_ckpt_metric=%s",
+            cfg["epochs"],
+            cfg.get("best_ckpt_metric"),
+        )
         train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
             train_with_threshold_tracking(
                 model,

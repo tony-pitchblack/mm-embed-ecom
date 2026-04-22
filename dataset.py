@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,8 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from models.siamese_clip import Tokenizers, get_transform
+
+logger = logging.getLogger(__name__)
 
 
 def _as_sku_list(x) -> List:
@@ -150,10 +153,25 @@ class PairwiseDataset(Dataset):
         precompute: bool = True,
         name_model_name: Optional[str] = None,
         description_model_name: Optional[str] = None,
+        pair_gen_split_label: Optional[str] = None,
     ):
+        logger.debug(
+            "PairwiseDataset __init__ split=%r reset_index …",
+            pair_gen_split_label,
+        )
         self.split_df = split_df.reset_index(drop=True)
+        self.pair_gen_split_label = pair_gen_split_label
         self.source_df_tabular = source_df
-        self.source_df = source_df.set_index("sku") if source_df is not None else None
+        if source_df is not None:
+            logger.debug(
+                "set_index('sku') on source_df, %d rows (split=%r) …",
+                len(source_df),
+                pair_gen_split_label,
+            )
+            self.source_df = source_df.set_index("sku")
+            logger.debug("set_index done: %d indexed rows", len(self.source_df))
+        else:
+            self.source_df = None
         self.images_dir = images_dir
         self.max_pos_pairs_per_query = max_pos_pairs_per_query
         self.pos_neg_ratio = pos_neg_ratio
@@ -162,14 +180,31 @@ class PairwiseDataset(Dataset):
         self.precompute = precompute
         random.seed(random_seed)
         np.random.seed(random_seed)
+        logger.debug(
+            "_generate_pairs: %d queries (split=%r) …",
+            len(self.split_df),
+            pair_gen_split_label,
+        )
         self.pairs = self._generate_pairs()
+        logger.debug(
+            "_generate_pairs done: %d pairs (split=%r)",
+            len(self.pairs),
+            pair_gen_split_label,
+        )
         self.sku_cache = None
         if precompute:
             if not name_model_name or not description_model_name:
                 raise ValueError("precompute=True requires name_model_name and description_model_name")
+            logger.debug("Tokenizers + transform (split=%r) …", pair_gen_split_label)
             self.tokenizers = Tokenizers(name_model_name, description_model_name)
             self.transform = get_transform()
+            logger.debug("preload_sku_data (split=%r) …", pair_gen_split_label)
             self.sku_cache = self._preload_sku_data(source_df)
+            logger.debug(
+                "preload_sku_data done: %d skus in cache (split=%r)",
+                len(self.sku_cache),
+                pair_gen_split_label,
+            )
 
     def _generate_positive_pairs_fixed(self, query_sku, pos_skus: List) -> List[Dict[str, Any]]:
         if not pos_skus or (
@@ -248,7 +283,17 @@ class PairwiseDataset(Dataset):
 
     def _generate_pairs(self) -> List[Dict[str, Any]]:
         all_pairs = []
-        for _, row in self.split_df.iterrows():
+        desc = (
+            f"generate_pairs[{self.pair_gen_split_label}]"
+            if self.pair_gen_split_label
+            else "generate_pairs"
+        )
+        row_iter = tqdm(
+            self.split_df.iterrows(),
+            total=len(self.split_df),
+            desc=desc,
+        )
+        for _, row in row_iter:
             query_sku = row["sku_query"]
             pos_skus = _as_sku_list(row["sku_pos"])
             hard_neg_skus = _as_sku_list(row["sku_hard_neg"])

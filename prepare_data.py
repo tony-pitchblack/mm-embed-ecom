@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from huggingface_hub import login, snapshot_download
 
 from dataset import PairwiseDataset, split_query_groups
+from logging_config import configure_logging
 
 
 def _processed_root(cfg: dict) -> Path:
@@ -16,6 +17,7 @@ def _processed_root(cfg: dict) -> Path:
 
 
 def main():
+    configure_logging()
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     args = p.parse_args()
@@ -82,6 +84,7 @@ def main():
             hard_soft_ratio=cfg["hard_soft_ratio"],
             random_seed=cfg["random_seed"],
             precompute=False,
+            pair_gen_split_label=split,
         )
         pw = ds.to_pairwise_dataframe()
         params = [

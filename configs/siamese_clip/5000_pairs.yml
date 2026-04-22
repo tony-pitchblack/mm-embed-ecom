@@ -24,6 +24,7 @@ contrastive_margin: 1.0
 contrastive_threshold: 0.3
 
 batch_size_per_device: 60
+device: cuda
 epochs: 10
 lr: 3.0e-5
 momentum: 0.9
