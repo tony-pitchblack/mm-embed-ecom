@@ -1,4 +1,0 @@
-[submodule "FastCLIP"]
-	path = FastCLIP
-	url = https://github.com/Optimization-AI/FastCLIP.git
-	branch = main
