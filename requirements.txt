@@ -2,7 +2,7 @@ torch
 torchvision
 transformers
 timm
-mlflow
+mlflow[mcp]>=3.5.1
 huggingface_hub
 python-dotenv
 pandas

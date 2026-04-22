@@ -24,7 +24,7 @@ contrastive_margin: 1.5
 contrastive_threshold: 0.3
 
 batch_size_per_device: 1
-epochs: 1
+epochs: 2
 lr: 9.0e-5
 momentum: 0.9
 weight_decay: 0.01
