@@ -1,0 +1,17 @@
+torch
+torchvision
+transformers
+timm
+mlflow
+huggingface_hub
+python-dotenv
+pandas
+pyarrow
+pyyaml
+scikit-learn
+opencv-python
+Pillow
+tqdm
+torchinfo
+psutil
+matplotlib

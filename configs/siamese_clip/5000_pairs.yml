@@ -1,0 +1,34 @@
+data_path: data/clip-siamese/
+repo_id: INDEEPA/clip-siamese
+source_table: tables_OZ_geo_5500/processed/OZ_geo_5500.csv
+pairwise_mapping_file: tables_OZ_geo_5500/processed/regex-pairwise-groups/regex-pairwise-groups_num-queries=20_patterns-dict-hash=a6223255f273e52a893ba7235e3c19b3/mapping.parquet
+img_dataset_name: images_OZ_geo_5500
+results_dir: train_results/
+
+val_ratio: 0.1
+test_ratio: 0.1
+random_seed: 42
+
+pos_neg_ratio: 1.0
+hard_soft_ratio: 0.7
+limit_train_pos_pairs_per_query: 5000
+limit_val_pos_pairs_per_query: null
+limit_test_pos_pairs_per_query: null
+limit_queries: null
+
+preload_model_name: cc12m_rubert_tiny_ep_1.pt
+name_model_name: cointegrated/rubert-tiny
+description_model_name: cointegrated/rubert-tiny
+dropout: 0.5
+contrastive_margin: 1.0
+contrastive_threshold: 0.3
+
+batch_size_per_device: 60
+epochs: 10
+lr: 3.0e-5
+momentum: 0.9
+weight_decay: 0.01
+scheduler_patience: 1
+best_ckpt_metric: f1
+
+mlflow_experiment: siamese/1fold
