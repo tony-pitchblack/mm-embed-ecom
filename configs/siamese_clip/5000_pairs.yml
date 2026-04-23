@@ -25,7 +25,7 @@ contrastive_threshold: auto
 
 batch_size_per_device: 160
 device: cuda
-epochs: 10
+epochs: 15
 lr: 3.0e-5
 momentum: 0.9
 weight_decay: 0.01
