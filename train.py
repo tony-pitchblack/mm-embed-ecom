@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from dotenv import load_dotenv
-from sklearn.metrics import f1_score, recall_score
+from sklearn.metrics import f1_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -63,7 +63,6 @@ def evaluation(
     threshold,
     margin,
     steps,
-    metric,
     source_df,
     images_dir,
     precompute_pairs,
@@ -71,11 +70,31 @@ def evaluation(
     name_model_name,
     description_model_name,
 ):
-    assert metric in ("f1", "pos_acc")
     assert split_name in ("val", "test")
     model.eval()
     if len(data_loader) == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, threshold or 0.0
+        empty_rank = {
+            "recall_at_5": 0.0,
+            "recall_at_10": 0.0,
+            "recall_at_100": 0.0,
+            "mrr_at_5": 0.0,
+            "mrr_at_10": 0.0,
+            "mrr_at_100": 0.0,
+            "ndcg_at_5": 0.0,
+            "ndcg_at_10": 0.0,
+            "ndcg_at_100": 0.0,
+        }
+        return {
+            "precision": 0.0,
+            "npv": 0.0,
+            "recall": 0.0,
+            "specificity": 0.0,
+            "balanced_accuracy": 0.0,
+            "f1_score": 0.0,
+            "loss": 0.0,
+            "threshold": threshold or 0.0,
+            **empty_rank,
+        }
     total_loss = 0.0
     all_d, all_lbl = [], []
     all_query = []
@@ -140,11 +159,7 @@ def evaluation(
         y_true = (labels.numpy() == 0).astype(int)
         for t in grid:
             y_pred = (distances.numpy() < t).astype(int)
-            if metric == "f1":
-                val = f1_score(y_true, y_pred, zero_division=0)
-            else:
-                pos_mask = y_true == 1
-                val = (y_pred[pos_mask] == 1).mean() if pos_mask.sum() > 0 else 0.0
+            val = f1_score(y_true, y_pred, zero_division=0)
             if val > best_val:
                 best_val, best_thr = val, t
         threshold = best_thr
@@ -153,42 +168,105 @@ def evaluation(
     preds = (distances < threshold).long()
     pos_mask = labels == 0
     neg_mask = labels == 1
-    pos_acc = preds[pos_mask].float().mean().item() if pos_mask.any() else 0.0
-    neg_acc = (preds[neg_mask] == 0).float().mean().item() if neg_mask.any() else 0.0
-    avg_acc = (pos_acc + neg_acc) / 2.0
+    recall = preds[pos_mask].float().mean().item() if pos_mask.any() else 0.0
+    specificity = (preds[neg_mask] == 0).float().mean().item() if neg_mask.any() else 0.0
+    balanced_accuracy = (recall + specificity) / 2.0
     y_bin = (labels.numpy() == 0).astype(int)
     pred_bin = preds.numpy()
-    f1 = f1_score(y_bin, pred_bin, zero_division=0)
-    recall = recall_score(y_bin, pred_bin, zero_division=0)
-    mrr = 0.0
+    f1_score_val = f1_score(y_bin, pred_bin, zero_division=0)
+    tp = ((preds == 1) & (labels == 0)).sum().item()
+    fp = ((preds == 1) & (labels == 1)).sum().item()
+    tn = ((preds == 0) & (labels == 1)).sum().item()
+    fn = ((preds == 0) & (labels == 0)).sum().item()
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    npv = float(tn / (tn + fn)) if (tn + fn) > 0 else 0.0
+    rank_metrics = {
+        "recall_at_5": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_100": 0.0,
+        "mrr_at_5": 0.0,
+        "mrr_at_10": 0.0,
+        "mrr_at_100": 0.0,
+        "ndcg_at_5": 0.0,
+        "ndcg_at_10": 0.0,
+        "ndcg_at_100": 0.0,
+    }
     if all_query:
         dist_np = distances.numpy()
         lbl_np = labels.numpy()
         query_np = np.array(all_query)
-        reciprocal_ranks = []
+        ks = (5, 10, 100)
+        recalls_by_k = {k: [] for k in ks}
+        mrr_by_k = {k: [] for k in ks}
+        ndcg_by_k = {k: [] for k in ks}
         for query_id in np.unique(query_np):
             mask = query_np == query_id
             query_dist = dist_np[mask]
             query_lbl = lbl_np[mask]
+            total_relevant = int((query_lbl == 0).sum())
+            if total_relevant <= 0:
+                continue
             order = np.argsort(query_dist)
             ranked_lbl = query_lbl[order]
-            positive_idx = np.where(ranked_lbl == 0)[0]
-            if positive_idx.size > 0:
-                reciprocal_ranks.append(1.0 / float(positive_idx[0] + 1))
-        if reciprocal_ranks:
-            mrr = float(np.mean(reciprocal_ranks))
+            relevance = (ranked_lbl == 0).astype(np.int32)
+            positive_idx = np.where(relevance == 1)[0]
+            for k in ks:
+                topk_rel = relevance[:k]
+                hits_k = int(topk_rel.sum())
+                recalls_by_k[k].append(float(hits_k / total_relevant))
+                rr_k = 0.0
+                if positive_idx.size > 0:
+                    first_rank = int(positive_idx[0]) + 1
+                    if first_rank <= k:
+                        rr_k = 1.0 / float(first_rank)
+                mrr_by_k[k].append(rr_k)
+                if hits_k == 0:
+                    ndcg_by_k[k].append(0.0)
+                else:
+                    gains = topk_rel / np.log2(np.arange(2, len(topk_rel) + 2))
+                    dcg_k = float(gains.sum())
+                    ideal_len = min(total_relevant, k)
+                    ideal_rel = np.ones(ideal_len, dtype=np.float32)
+                    idcg_k = float((ideal_rel / np.log2(np.arange(2, ideal_len + 2))).sum())
+                    ndcg_by_k[k].append(float(dcg_k / idcg_k) if idcg_k > 0 else 0.0)
+        for k in ks:
+            if recalls_by_k[k]:
+                rank_metrics[f"recall_at_{k}"] = float(np.mean(recalls_by_k[k]))
+            if mrr_by_k[k]:
+                rank_metrics[f"mrr_at_{k}"] = float(np.mean(mrr_by_k[k]))
+            if ndcg_by_k[k]:
+                rank_metrics[f"ndcg_at_{k}"] = float(np.mean(ndcg_by_k[k]))
     if mlflow_active:
         prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
         kw = dict(step=step) if split_name == "val" else {}
         mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
-        mlflow.log_metric(f"{prefix}pos_accuracy", pos_acc, **kw)
-        mlflow.log_metric(f"{prefix}neg_accuracy", neg_acc, **kw)
-        mlflow.log_metric(f"{prefix}accuracy", avg_acc, **kw)
-        mlflow.log_metric(f"{prefix}f1_score", f1, **kw)
+        mlflow.log_metric(f"{prefix}precision", precision, **kw)
+        mlflow.log_metric(f"{prefix}npv", npv, **kw)
         mlflow.log_metric(f"{prefix}recall", recall, **kw)
-        mlflow.log_metric(f"{prefix}mrr", mrr, **kw)
-    return pos_acc, neg_acc, avg_acc, f1, mrr, avg_loss, best_thr
+        mlflow.log_metric(f"{prefix}specificity", specificity, **kw)
+        mlflow.log_metric(f"{prefix}balanced_accuracy", balanced_accuracy, **kw)
+        mlflow.log_metric(f"{prefix}f1_score", f1_score_val, **kw)
+        mlflow.log_metric(f"{prefix}recall_at_5", rank_metrics["recall_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}recall_at_10", rank_metrics["recall_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}recall_at_100", rank_metrics["recall_at_100"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_5", rank_metrics["mrr_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_10", rank_metrics["mrr_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_100", rank_metrics["mrr_at_100"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_5", rank_metrics["ndcg_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_10", rank_metrics["ndcg_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_100", rank_metrics["ndcg_at_100"], **kw)
+    return {
+        "precision": precision,
+        "npv": npv,
+        "recall": recall,
+        "specificity": specificity,
+        "balanced_accuracy": balanced_accuracy,
+        "f1_score": f1_score_val,
+        "loss": avg_loss,
+        "threshold": best_thr,
+        **rank_metrics,
+    }
 
 
 def train_with_threshold_tracking(
@@ -200,7 +278,6 @@ def train_with_threshold_tracking(
     valid_loader,
     device,
     models_dir,
-    metric,
     source_df,
     images_dir,
     precompute_pairs,
@@ -295,7 +372,7 @@ def train_with_threshold_tracking(
                     sys.exit(0)
         train_losses.append(total_train_loss / max(len(train_loader), 1))
         if valid_loader is not None:
-            pos_acc, neg_acc, avg_acc, f1_val, _mrr_val, val_loss, val_thr = evaluation(
+            val_metrics = evaluation(
                 model,
                 criterion,
                 valid_loader,
@@ -305,7 +382,6 @@ def train_with_threshold_tracking(
                 threshold=None,
                 margin=contrastive_margin,
                 steps=200,
-                metric=metric,
                 source_df=source_df,
                 images_dir=images_dir,
                 precompute_pairs=precompute_pairs,
@@ -313,12 +389,12 @@ def train_with_threshold_tracking(
                 name_model_name=name_model_name,
                 description_model_name=description_model_name,
             )
-            val_losses.append(val_loss)
-            cur_metric = pos_acc if metric == "pos_acc" else f1_val
+            val_losses.append(val_metrics["loss"])
+            cur_metric = val_metrics["mrr_at_10"]
             scheduler.step(cur_metric)
             if cur_metric > best_valid_metric:
                 best_valid_metric = cur_metric
-                best_threshold = val_thr
+                best_threshold = val_metrics["threshold"]
                 sd = (
                     model.module.state_dict()
                     if isinstance(model, torch.nn.DataParallel)
@@ -327,9 +403,11 @@ def train_with_threshold_tracking(
                 best_weights = {k: v.detach().cpu().clone() for k, v in sd.items()}
                 if models_dir:
                     checkpoint_filename = (
-                        f"siamese_contrastive_soft-neg_val_ep{epoch}_f1-{f1_val:.3f}_pacc-{pos_acc:.3f}_nacc-{neg_acc:.3f}_"
+                        f"siamese_contrastive_soft-neg_val_ep{epoch}_mrr10-{val_metrics['mrr_at_10']:.3f}_"
+                        f"f1-{val_metrics['f1_score']:.3f}_precision-{val_metrics['precision']:.3f}_"
+                        f"recall-{val_metrics['recall']:.3f}_specificity-{val_metrics['specificity']:.3f}_"
                         f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
-                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_thr:.3f}.pt"
+                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_metrics['threshold']:.3f}.pt"
                     )
                     torch.save(best_weights, Path(models_dir) / checkpoint_filename)
     return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
@@ -477,9 +555,8 @@ def main():
         if mlflow_active:
             mlflow.log_params({k: str(v) for k, v in cfg.items() if isinstance(v, (int, float, str))})
         logger.debug(
-            "entering training: epochs=%d, best_ckpt_metric=%s",
+            "entering training: epochs=%d, best_ckpt_metric=mrr_at_10",
             cfg["epochs"],
-            cfg.get("best_ckpt_metric"),
         )
         train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
             train_with_threshold_tracking(
@@ -491,7 +568,6 @@ def main():
                 loaders["val"],
                 device,
                 str(tmp_ckpt),
-                cfg["best_ckpt_metric"],
                 source_df,
                 images_dir,
                 True,
@@ -519,7 +595,7 @@ def main():
             model.module.load_state_dict(best_weights)
         else:
             model.load_state_dict(best_weights)
-        test_pos_acc, test_neg_acc, test_acc, test_f1, _test_mrr, test_loss, _ = evaluation(
+        test_metrics = evaluation(
             model,
             criterion,
             loaders["test"],
@@ -529,7 +605,6 @@ def main():
             threshold=best_threshold,
             margin=cfg["contrastive_margin"],
             steps=200,
-            metric=cfg["best_ckpt_metric"],
             source_df=source_df,
             images_dir=images_dir,
             precompute_pairs=True,
@@ -538,7 +613,9 @@ def main():
             description_model_name=cfg["description_model_name"],
         )
         filename = (
-            f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_f1-{test_f1:.3f}_pacc-{test_pos_acc:.3f}_nacc-{test_neg_acc:.3f}_"
+            f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_mrr10-{test_metrics['mrr_at_10']:.3f}_"
+            f"f1-{test_metrics['f1_score']:.3f}_precision-{test_metrics['precision']:.3f}_"
+            f"recall-{test_metrics['recall']:.3f}_specificity-{test_metrics['specificity']:.3f}_"
             f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
             f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}_"
             f"thr{best_threshold:.3f}.pt"
