@@ -23,7 +23,7 @@ dropout: 0.5
 contrastive_margin: 1.5
 contrastive_threshold: 0.3
 
-batch_size_per_device: 1
+batch_size_per_device: 160
 device: cuda
 epochs: 2
 lr: 9.0e-5
