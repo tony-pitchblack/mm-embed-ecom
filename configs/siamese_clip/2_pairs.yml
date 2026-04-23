@@ -21,7 +21,7 @@ name_model_name: cointegrated/rubert-tiny
 description_model_name: cointegrated/rubert-tiny
 dropout: 0.5
 contrastive_margin: 1.5
-contrastive_threshold: 0.3
+contrastive_threshold: auto
 
 batch_size_per_device: 160
 device: cuda
@@ -29,7 +29,8 @@ epochs: 2
 lr: 9.0e-5
 momentum: 0.9
 weight_decay: 0.01
-scheduler_patience: 3
-best_ckpt_metric: f1
+scheduler_patience: 2
+best_ckpt_metric: ndcg_at_10
+early_stop_patience: 3
 
 mlflow_experiment: siamese/1fold

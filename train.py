@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from dotenv import load_dotenv
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, fbeta_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -159,7 +159,7 @@ def evaluation(
         y_true = (labels.numpy() == 0).astype(int)
         for t in grid:
             y_pred = (distances.numpy() < t).astype(int)
-            val = f1_score(y_true, y_pred, zero_division=0)
+            val = fbeta_score(y_true, y_pred, beta=2.0, zero_division=0)
             if val > best_val:
                 best_val, best_thr = val, t
         threshold = best_thr
@@ -240,6 +240,7 @@ def evaluation(
         prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
         kw = dict(step=step) if split_name == "val" else {}
+        mlflow.log_metric(f"{prefix}threshold", float(best_thr), **kw)
         mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
         mlflow.log_metric(f"{prefix}precision", precision, **kw)
         mlflow.log_metric(f"{prefix}npv", npv, **kw)
@@ -290,11 +291,16 @@ def train_with_threshold_tracking(
     mlflow_active,
     name_model_name,
     description_model_name,
+    best_ckpt_metric,
+    early_stop_patience,
+    contrastive_threshold,
 ):
     model.to(device)
     train_losses, val_losses = [], []
     best_valid_metric, best_threshold = float("-inf"), None
     best_weights = None
+    best_val_loss = float("inf")
+    epochs_since_loss_improved = 0
     if not precompute_pairs:
         tokenizers = Tokenizers(name_model_name, description_model_name)
         transform = get_transform()
@@ -379,7 +385,7 @@ def train_with_threshold_tracking(
                 epoch,
                 device=device,
                 split_name="val",
-                threshold=None,
+                threshold=contrastive_threshold,
                 margin=contrastive_margin,
                 steps=200,
                 source_df=source_df,
@@ -390,7 +396,12 @@ def train_with_threshold_tracking(
                 description_model_name=description_model_name,
             )
             val_losses.append(val_metrics["loss"])
-            cur_metric = val_metrics["mrr_at_10"]
+            if best_ckpt_metric not in val_metrics:
+                raise KeyError(
+                    f"best_ckpt_metric={best_ckpt_metric!r} not in val metrics: "
+                    f"{sorted(val_metrics)}"
+                )
+            cur_metric = val_metrics[best_ckpt_metric]
             scheduler.step(cur_metric)
             if cur_metric > best_valid_metric:
                 best_valid_metric = cur_metric
@@ -402,14 +413,27 @@ def train_with_threshold_tracking(
                 )
                 best_weights = {k: v.detach().cpu().clone() for k, v in sd.items()}
                 if models_dir:
+                    metric_tag = best_ckpt_metric.replace("/", "-")
                     checkpoint_filename = (
-                        f"siamese_contrastive_soft-neg_val_ep{epoch}_mrr10-{val_metrics['mrr_at_10']:.3f}_"
+                        f"siamese_contrastive_soft-neg_val_ep{epoch}_{metric_tag}-{cur_metric:.3f}_"
                         f"f1-{val_metrics['f1_score']:.3f}_precision-{val_metrics['precision']:.3f}_"
                         f"recall-{val_metrics['recall']:.3f}_specificity-{val_metrics['specificity']:.3f}_"
                         f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
                         f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_metrics['threshold']:.3f}.pt"
                     )
                     torch.save(best_weights, Path(models_dir) / checkpoint_filename)
+            if val_metrics["loss"] < best_val_loss - 1e-4:
+                best_val_loss = val_metrics["loss"]
+                epochs_since_loss_improved = 0
+            else:
+                epochs_since_loss_improved += 1
+                if early_stop_patience is not None and epochs_since_loss_improved >= early_stop_patience:
+                    logger.info(
+                        "early stop: val/loss did not improve for %d epochs (best=%.4f)",
+                        early_stop_patience,
+                        best_val_loss,
+                    )
+                    break
     return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
 
 
@@ -554,9 +578,19 @@ def main():
     try:
         if mlflow_active:
             mlflow.log_params({k: str(v) for k, v in cfg.items() if isinstance(v, (int, float, str))})
+        best_ckpt_metric = cfg.get("best_ckpt_metric", "ndcg_at_10")
+        early_stop_patience = cfg.get("early_stop_patience")
+        thr_cfg = cfg.get("contrastive_threshold", "auto")
+        if isinstance(thr_cfg, str) and thr_cfg.lower() == "auto":
+            contrastive_threshold = None
+        else:
+            contrastive_threshold = float(thr_cfg)
         logger.debug(
-            "entering training: epochs=%d, best_ckpt_metric=mrr_at_10",
+            "entering training: epochs=%d, best_ckpt_metric=%s, early_stop_patience=%s, contrastive_threshold=%s",
             cfg["epochs"],
+            best_ckpt_metric,
+            early_stop_patience,
+            "auto" if contrastive_threshold is None else contrastive_threshold,
         )
         train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
             train_with_threshold_tracking(
@@ -580,6 +614,9 @@ def main():
                 mlflow_active,
                 cfg["name_model_name"],
                 cfg["description_model_name"],
+                best_ckpt_metric,
+                early_stop_patience,
+                contrastive_threshold,
             )
         )
         if best_weights is None:
@@ -612,8 +649,9 @@ def main():
             name_model_name=cfg["name_model_name"],
             description_model_name=cfg["description_model_name"],
         )
+        metric_tag = best_ckpt_metric.replace("/", "-")
         filename = (
-            f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_mrr10-{test_metrics['mrr_at_10']:.3f}_"
+            f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
             f"f1-{test_metrics['f1_score']:.3f}_precision-{test_metrics['precision']:.3f}_"
             f"recall-{test_metrics['recall']:.3f}_specificity-{test_metrics['specificity']:.3f}_"
             f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
