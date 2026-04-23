@@ -1,0 +1,8 @@
+title_vectors: 4
+desc_vectors: 4
+image_vectors: 8
+batch_size: 128
+device: cuda
+bins: 60
+max_queries: null
+output_dir: logs
