@@ -661,6 +661,9 @@ def main():
         final_path = results_root / filename
         final_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(best_weights, final_path)
+        if mlflow_active:
+            mlflow.log_artifact(str(final_path), artifact_path="model")
+            mlflow.set_tag("checkpoint_filename", final_path.name)
     finally:
         if run_ctx is not None:
             mlflow.end_run()
