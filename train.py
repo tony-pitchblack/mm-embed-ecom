@@ -75,15 +75,18 @@ def evaluation(
     assert split_name in ("val", "test")
     model.eval()
     if len(data_loader) == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, threshold or 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, threshold or 0.0
     total_loss = 0.0
     all_d, all_lbl = [], []
+    all_query = []
     if not precompute_pairs:
         tokenizers = Tokenizers(name_model_name, description_model_name)
         transform = get_transform()
     else:
         tokenizers = None
         transform = None
+    dataset_pairs = getattr(data_loader.dataset, "pairs", None)
+    pair_offset = 0
     use_amp = device == "cuda"
     amp_dtype = (
         torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
@@ -98,10 +101,18 @@ def evaluation(
                 n2 = batch["name_second"].to(device, non_blocking=True)
                 d2 = batch["desc_second"].to(device, non_blocking=True)
                 labels = batch["label"].to(device, non_blocking=True)
+                batch_size = int(labels.shape[0])
+                if dataset_pairs is not None:
+                    batch_query = [
+                        dataset_pairs[i]["query_sku"] for i in range(pair_offset, pair_offset + batch_size)
+                    ]
+                    all_query.extend(batch_query)
+                pair_offset += batch_size
             else:
                 sku_first = batch["sku_first"]
                 sku_second = batch["sku_second"]
                 labels = batch["label"].to(device, non_blocking=True)
+                all_query.extend([int(x) for x in batch["query_sku"]])
                 im1, n1, d1 = sku_to_model_inputs(
                     sku_first.tolist(), source_df, images_dir, tokenizers, transform
                 )
@@ -149,6 +160,23 @@ def evaluation(
     pred_bin = preds.numpy()
     f1 = f1_score(y_bin, pred_bin, zero_division=0)
     recall = recall_score(y_bin, pred_bin, zero_division=0)
+    mrr = 0.0
+    if all_query:
+        dist_np = distances.numpy()
+        lbl_np = labels.numpy()
+        query_np = np.array(all_query)
+        reciprocal_ranks = []
+        for query_id in np.unique(query_np):
+            mask = query_np == query_id
+            query_dist = dist_np[mask]
+            query_lbl = lbl_np[mask]
+            order = np.argsort(query_dist)
+            ranked_lbl = query_lbl[order]
+            positive_idx = np.where(ranked_lbl == 0)[0]
+            if positive_idx.size > 0:
+                reciprocal_ranks.append(1.0 / float(positive_idx[0] + 1))
+        if reciprocal_ranks:
+            mrr = float(np.mean(reciprocal_ranks))
     if mlflow_active:
         prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
@@ -159,7 +187,8 @@ def evaluation(
         mlflow.log_metric(f"{prefix}accuracy", avg_acc, **kw)
         mlflow.log_metric(f"{prefix}f1_score", f1, **kw)
         mlflow.log_metric(f"{prefix}recall", recall, **kw)
-    return pos_acc, neg_acc, avg_acc, f1, avg_loss, best_thr
+        mlflow.log_metric(f"{prefix}mrr", mrr, **kw)
+    return pos_acc, neg_acc, avg_acc, f1, mrr, avg_loss, best_thr
 
 
 def train_with_threshold_tracking(
@@ -266,7 +295,7 @@ def train_with_threshold_tracking(
                     sys.exit(0)
         train_losses.append(total_train_loss / max(len(train_loader), 1))
         if valid_loader is not None:
-            pos_acc, neg_acc, avg_acc, f1_val, val_loss, val_thr = evaluation(
+            pos_acc, neg_acc, avg_acc, f1_val, _mrr_val, val_loss, val_thr = evaluation(
                 model,
                 criterion,
                 valid_loader,
@@ -490,7 +519,7 @@ def main():
             model.module.load_state_dict(best_weights)
         else:
             model.load_state_dict(best_weights)
-        test_pos_acc, test_neg_acc, test_acc, test_f1, test_loss, _ = evaluation(
+        test_pos_acc, test_neg_acc, test_acc, test_f1, _test_mrr, test_loss, _ = evaluation(
             model,
             criterion,
             loaders["test"],
