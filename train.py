@@ -275,6 +275,17 @@ def _unwrap_model(m):
     return m.module if isinstance(m, torch.nn.DataParallel) else m
 
 
+def _paired_late_interaction(query_vectors: torch.Tensor, doc_vectors: torch.Tensor) -> torch.Tensor:
+    if query_vectors.dim() != 3 or doc_vectors.dim() != 3:
+        raise ValueError("query and doc vectors must be batched 3D tensors")
+    if query_vectors.shape[0] != doc_vectors.shape[0]:
+        raise ValueError("query and doc batch sizes must match")
+    if query_vectors.shape[-1] != doc_vectors.shape[-1]:
+        raise ValueError("query and doc last dim must match")
+    sim = torch.einsum("bqd,bkd->bqk", query_vectors, doc_vectors)
+    return sim.max(dim=-1).values.sum(dim=-1)
+
+
 def colbert_pair_score_and_distance(
     model: SiameseRuCLIPColBERT,
     im1: torch.Tensor,
@@ -290,9 +301,9 @@ def colbert_pair_score_and_distance(
     m = _unwrap_model(model)
     a = m.encode_multivectors(im1, n1, d1, n_title, n_desc, n_img)
     k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
-    name_score = m.late_interaction(a["name"], k["name"]) / float(max(n_title, 1))
-    desc_score = m.late_interaction(a["desc"], k["desc"]) / float(max(n_desc, 1))
-    img_score = m.late_interaction(a["img"], k["img"]) / float(max(n_img, 1))
+    name_score = _paired_late_interaction(a["name"], k["name"]) / float(max(n_title, 1))
+    desc_score = _paired_late_interaction(a["desc"], k["desc"]) / float(max(n_desc, 1))
+    img_score = _paired_late_interaction(a["img"], k["img"]) / float(max(n_img, 1))
     score = (name_score + desc_score + img_score) / 3.0
     distance = 1.0 - score
     return score, distance
