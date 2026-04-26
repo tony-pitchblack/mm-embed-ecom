@@ -44,6 +44,7 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
         use_projection_heads: bool = True,
         freeze_patterns: Optional[List[str]] = None,
         unfreeze_patterns: Optional[List[str]] = None,
+        infonce_temperature: float = 0.5,
     ):
         super().__init__(
             device, name_model_name, description_model_name, preload_model_name, models_dir, dropout
@@ -64,8 +65,11 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
             self.name_proj = None
             self.desc_proj = None
             self.image_proj = None
+        temperature = float(infonce_temperature)
+        if temperature <= 0.0:
+            raise ValueError("infonce_temperature must be > 0")
         self._colbert_logit_scale = nn.Parameter(
-            torch.tensor(float(np.log(1.0 / 0.07)), device=device_t)
+            torch.tensor(float(np.log(1.0 / temperature)), device=device_t)
         )
         self.apply_freeze_config()
 
@@ -92,21 +96,25 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
         if num_vectors <= 0:
             raise ValueError("num_vectors must be > 0")
         bsz, seq_len, hid = hidden_states.shape
-        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
-        masked_hidden = hidden_states * mask
-        edges = torch.linspace(0, seq_len, num_vectors + 1, device=hidden_states.device).long()
-        chunks = []
-        for i in range(num_vectors):
-            start = int(edges[i].item())
-            end = int(edges[i + 1].item())
-            if end <= start:
-                end = min(start + 1, seq_len)
-                start = max(0, end - 1)
-            chunk_hidden = masked_hidden[:, start:end, :]
-            chunk_mask = mask[:, start:end, :]
-            denom = chunk_mask.sum(dim=1).clamp_min(1.0)
-            chunks.append(chunk_hidden.sum(dim=1) / denom)
-        pooled = torch.stack(chunks, dim=1).view(bsz, num_vectors, hid)
+        pooled = hidden_states.new_zeros((bsz, num_vectors, hid))
+        mask = attention_mask.bool()
+        for b in range(bsz):
+            valid_idx = torch.where(mask[b])[0]
+            if valid_idx.numel() == 0:
+                valid_hidden = hidden_states[b : b + 1, :1, :].squeeze(0)
+            else:
+                valid_hidden = hidden_states[b, valid_idx, :]
+            valid_len = valid_hidden.size(0)
+            edges = torch.linspace(
+                0, valid_len, steps=num_vectors + 1, device=hidden_states.device
+            ).long()
+            for i in range(num_vectors):
+                start = int(edges[i].item())
+                end = int(edges[i + 1].item())
+                if end <= start:
+                    end = min(start + 1, valid_len)
+                    start = max(0, end - 1)
+                pooled[b, i, :] = valid_hidden[start:end, :].mean(dim=0)
         if normalize:
             return F.normalize(pooled, dim=-1)
         return pooled

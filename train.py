@@ -275,7 +275,30 @@ def _unwrap_model(m):
     return m.module if isinstance(m, torch.nn.DataParallel) else m
 
 
-def colbert_infonce_loss(
+def colbert_pair_score_and_distance(
+    model: SiameseRuCLIPColBERT,
+    im1: torch.Tensor,
+    n1: torch.Tensor,
+    d1: torch.Tensor,
+    im2: torch.Tensor,
+    n2: torch.Tensor,
+    d2: torch.Tensor,
+    n_title: int,
+    n_desc: int,
+    n_img: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = _unwrap_model(model)
+    a = m.encode_multivectors(im1, n1, d1, n_title, n_desc, n_img)
+    k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
+    name_score = m.late_interaction(a["name"], k["name"]) / float(max(n_title, 1))
+    desc_score = m.late_interaction(a["desc"], k["desc"]) / float(max(n_desc, 1))
+    img_score = m.late_interaction(a["img"], k["img"]) / float(max(n_img, 1))
+    score = (name_score + desc_score + img_score) / 3.0
+    distance = 1.0 - score
+    return score, distance
+
+
+def colbert_contrastive_loss(
     model: SiameseRuCLIPColBERT,
     im1: torch.Tensor,
     n1: torch.Tensor,
@@ -287,27 +310,16 @@ def colbert_infonce_loss(
     n_title: int,
     n_desc: int,
     n_img: int,
-) -> torch.Tensor:
-    m = _unwrap_model(model)
-    lab = label.view(-1)
-    pos = lab < 0.5
-    scale = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0)
-    if not pos.any():
-        return (m.colbert_logit_scale_param * 0.0).sum() + 0.0 * im1.sum() * 0.0
-    pos_idx = torch.where(pos)[0]
-    a = m.encode_multivectors(
-        im1[pos_idx], n1[pos_idx], d1[pos_idx], n_title, n_desc, n_img
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    score, distance = colbert_pair_score_and_distance(
+        model, im1, n1, d1, im2, n2, d2, n_title, n_desc, n_img
     )
-    k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
-    S = m.colbert_score_matrix(
-        a["name"],
-        a["desc"],
-        a["img"],
-        k["name"],
-        k["desc"],
-        k["img"],
-    )
-    return F.cross_entropy(scale * S, pos_idx)
+    labels = label.view(-1).float()
+    pos = (1.0 - labels) * torch.pow(distance, 2)
+    neg = labels * torch.pow(torch.clamp(margin - distance, min=0.0), 2)
+    loss = torch.mean(pos + neg)
+    return loss, score, distance
 
 
 def evaluation_colbert(
@@ -319,6 +331,7 @@ def evaluation_colbert(
     n_title: int,
     n_desc: int,
     n_img: int,
+    margin: float,
     mlflow_active: bool,
 ) -> dict:
     assert split_name in ("val", "test")
@@ -327,7 +340,6 @@ def evaluation_colbert(
     if len(data_loader) == 0:
         return {
             "loss": 0.0,
-            "infonce_top1": 0.0,
             "threshold": 0.0,
             "precision": 0.0,
             "npv": 0.0,
@@ -346,9 +358,7 @@ def evaluation_colbert(
             "ndcg_at_100": 0.0,
         }
     total_loss = 0.0
-    total_acc = 0.0
-    n_acc = 0
-    all_scores, all_lbl = [], []
+    all_scores, all_lbl, all_dist = [], [], []
     all_query = []
     use_amp = device == "cuda"
     amp_dtype = (
@@ -369,35 +379,50 @@ def evaluation_colbert(
             else:
                 all_query.extend(list(q))
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                loss = colbert_infonce_loss(
-                    model, im1, n1, d1, im2, n2, d2, labels, n_title, n_desc, n_img
+                loss, pair_score, pair_dist = colbert_contrastive_loss(
+                    model,
+                    im1,
+                    n1,
+                    d1,
+                    im2,
+                    n2,
+                    d2,
+                    labels,
+                    n_title,
+                    n_desc,
+                    n_img,
+                    margin,
                 )
-                a_all = m.encode_multivectors(im1, n1, d1, n_title, n_desc, n_img)
-                k_all = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
-                S_all = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0) * m.colbert_score_matrix(
-                    a_all["name"],
-                    a_all["desc"],
-                    a_all["img"],
-                    k_all["name"],
-                    k_all["desc"],
-                    k_all["img"],
-                )
-                lab = labels.view(-1)
-                pos = lab < 0.5
-                if pos.any():
-                    pos_idx = torch.where(pos)[0]
-                    pred = S_all[pos_idx].argmax(dim=1)
-                    acc = (pred == pos_idx).float().mean()
-                else:
-                    acc = torch.tensor(0.0, device=device)
             total_loss += loss.item()
-            if pos.any():
-                total_acc += acc.item()
-                n_acc += 1
-            all_scores.append(torch.diagonal(S_all).detach().float().cpu())
+            all_scores.append(pair_score.detach().float().cpu())
+            all_dist.append(pair_dist.detach().float().cpu())
             all_lbl.append(labels.detach().cpu())
     avg_loss = total_loss / max(len(data_loader), 1)
-    avg_acc = total_acc / max(n_acc, 1)
+    distances = torch.cat(all_dist)
+    labels = torch.cat(all_lbl)
+    grid = np.linspace(0.0, margin, 200)
+    best_val, best_thr = -1.0, 0.0
+    y_true = (labels.numpy() == 0).astype(int)
+    for t in grid:
+        y_pred = (distances.numpy() < t).astype(int)
+        val = fbeta_score(y_true, y_pred, beta=2.0, zero_division=0)
+        if val > best_val:
+            best_val, best_thr = val, t
+    preds = (distances < best_thr).long()
+    pos_mask = labels == 0
+    neg_mask = labels == 1
+    recall = preds[pos_mask].float().mean().item() if pos_mask.any() else 0.0
+    specificity = (preds[neg_mask] == 0).float().mean().item() if neg_mask.any() else 0.0
+    balanced_accuracy = (recall + specificity) / 2.0
+    y_bin = (labels.numpy() == 0).astype(int)
+    pred_bin = preds.numpy()
+    f1_score_val = f1_score(y_bin, pred_bin, zero_division=0)
+    tp = ((preds == 1) & (labels == 0)).sum().item()
+    fp = ((preds == 1) & (labels == 1)).sum().item()
+    tn = ((preds == 0) & (labels == 1)).sum().item()
+    fn = ((preds == 0) & (labels == 0)).sum().item()
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    npv = float(tn / (tn + fn)) if (tn + fn) > 0 else 0.0
     rank_metrics = {
         "recall_at_5": 0.0,
         "recall_at_10": 0.0,
@@ -459,7 +484,13 @@ def evaluation_colbert(
         step = int(epoch) if isinstance(epoch, int) else 0
         kw = dict(step=step)
         mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
-        mlflow.log_metric(f"{prefix}infonce_top1", avg_acc, **kw)
+        mlflow.log_metric(f"{prefix}threshold", float(best_thr), **kw)
+        mlflow.log_metric(f"{prefix}precision", precision, **kw)
+        mlflow.log_metric(f"{prefix}npv", npv, **kw)
+        mlflow.log_metric(f"{prefix}recall", recall, **kw)
+        mlflow.log_metric(f"{prefix}specificity", specificity, **kw)
+        mlflow.log_metric(f"{prefix}balanced_accuracy", balanced_accuracy, **kw)
+        mlflow.log_metric(f"{prefix}f1_score", f1_score_val, **kw)
         mlflow.log_metric(f"{prefix}recall_at_5", rank_metrics["recall_at_5"], **kw)
         mlflow.log_metric(f"{prefix}recall_at_10", rank_metrics["recall_at_10"], **kw)
         mlflow.log_metric(f"{prefix}recall_at_100", rank_metrics["recall_at_100"], **kw)
@@ -471,14 +502,13 @@ def evaluation_colbert(
         mlflow.log_metric(f"{prefix}ndcg_at_100", rank_metrics["ndcg_at_100"], **kw)
     return {
         "loss": avg_loss,
-        "infonce_top1": avg_acc,
-        "threshold": 0.0,
-        "precision": 0.0,
-        "npv": 0.0,
-        "recall": 0.0,
-        "specificity": 0.0,
-        "balanced_accuracy": 0.0,
-        "f1_score": 0.0,
+        "threshold": float(best_thr),
+        "precision": precision,
+        "npv": npv,
+        "recall": recall,
+        "specificity": specificity,
+        "balanced_accuracy": balanced_accuracy,
+        "f1_score": f1_score_val,
         **rank_metrics,
     }
 
@@ -650,7 +680,7 @@ def train_with_threshold_tracking(
     return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
 
 
-def train_with_colbert_infonce(
+def train_with_colbert_contrastive(
     model,
     optimizer,
     epochs_num,
@@ -669,11 +699,17 @@ def train_with_colbert_infonce(
     n_title,
     n_desc,
     n_img,
+    contrastive_margin,
 ):
     model.to(device)
     train_losses, val_losses = [], []
     maximize = best_ckpt_metric in (
-        "infonce_top1",
+        "precision",
+        "npv",
+        "recall",
+        "specificity",
+        "balanced_accuracy",
+        "f1_score",
         "recall_at_5",
         "recall_at_10",
         "recall_at_100",
@@ -719,8 +755,19 @@ def train_with_colbert_infonce(
             labels = batch["label"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                loss = colbert_infonce_loss(
-                    model, im1, n1, d1, im2, n2, d2, labels, n_title, n_desc, n_img
+                loss, _, _ = colbert_contrastive_loss(
+                    model,
+                    im1,
+                    n1,
+                    d1,
+                    im2,
+                    n2,
+                    d2,
+                    labels,
+                    n_title,
+                    n_desc,
+                    n_img,
+                    contrastive_margin,
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -753,6 +800,7 @@ def train_with_colbert_infonce(
                 n_title=n_title,
                 n_desc=n_desc,
                 n_img=n_img,
+                margin=contrastive_margin,
                 mlflow_active=mlflow_active,
             )
             val_losses.append(val_metrics["loss"])
@@ -776,10 +824,11 @@ def train_with_colbert_infonce(
                 if models_dir:
                     metric_tag = best_ckpt_metric.replace("/", "-")
                     checkpoint_filename = (
-                        f"siamese_colbert_infonce_val_ep{epoch}_{metric_tag}-{cur_metric:.3f}_"
-                        f"top1-{val_metrics['infonce_top1']:.3f}_"
+                        f"siamese_colbert_contrastive_val_ep{epoch}_{metric_tag}-{cur_metric:.3f}_"
+                        f"f1-{val_metrics['f1_score']:.3f}_precision-{val_metrics['precision']:.3f}_"
+                        f"recall-{val_metrics['recall']:.3f}_specificity-{val_metrics['specificity']:.3f}_"
                         f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
-                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}.pt"
+                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}_thr{val_metrics['threshold']:.3f}.pt"
                     )
                     torch.save(best_weights, Path(models_dir) / checkpoint_filename)
             if val_metrics["loss"] < best_val_loss - 1e-4:
@@ -919,6 +968,11 @@ def main():
     num_gpus = torch.cuda.device_count()
     mkey = str(cfg.get("model", "siamese_clip"))
     if mkey == "siamese_clip_colbert":
+        temp_cfg = cfg.get("infonce_temperature", "auto")
+        if isinstance(temp_cfg, str) and temp_cfg.lower() == "auto":
+            infonce_temperature = 0.5
+        else:
+            infonce_temperature = float(temp_cfg)
         logger.debug("building SiameseRuCLIPColBERT (download/load weights if needed) …")
         model = SiameseRuCLIPColBERT(
             device,
@@ -931,6 +985,7 @@ def main():
             bool(cfg.get("use_projection_heads", True)),
             cfg.get("freeze_patterns"),
             cfg.get("unfreeze_patterns"),
+            infonce_temperature,
         )
         n_title = int(cfg["title_vectors"])
         n_desc = int(cfg["desc_vectors"])
@@ -968,7 +1023,7 @@ def main():
         if mlflow_active:
             mlflow.log_params({k: str(v) for k, v in cfg.items() if isinstance(v, (int, float, str))})
         if mkey == "siamese_clip_colbert":
-            best_ckpt_metric = cfg.get("best_ckpt_metric", "loss")
+            best_ckpt_metric = cfg.get("best_ckpt_metric", "ndcg_at_10")
             early_stop_patience = cfg.get("early_stop_patience")
             thr_cfg = "auto"
             contrastive_threshold = None
@@ -990,7 +1045,7 @@ def main():
         )
         if mkey == "siamese_clip_colbert":
             train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
-                train_with_colbert_infonce(
+                train_with_colbert_contrastive(
                     model,
                     optimizer,
                     cfg["epochs"],
@@ -1009,6 +1064,7 @@ def main():
                     n_title,
                     n_desc,
                     n_img,
+                    cfg["contrastive_margin"],
                 )
             )
         else:
@@ -1063,14 +1119,17 @@ def main():
                 n_title=n_title,
                 n_desc=n_desc,
                 n_img=n_img,
+                margin=cfg["contrastive_margin"],
                 mlflow_active=mlflow_active,
             )
             metric_tag = best_ckpt_metric.replace("/", "-")
             filename = (
-                f"siamese_colbert_infonce_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
-                f"top1-{test_metrics['infonce_top1']:.3f}_"
+                f"siamese_colbert_contrastive_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
+                f"f1-{test_metrics['f1_score']:.3f}_precision-{test_metrics['precision']:.3f}_"
+                f"recall-{test_metrics['recall']:.3f}_specificity-{test_metrics['specificity']:.3f}_"
                 f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
-                f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}.pt"
+                f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}_"
+                f"thr{test_metrics['threshold']:.3f}.pt"
             )
         else:
             test_metrics = evaluation(
