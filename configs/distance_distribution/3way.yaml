@@ -1,0 +1,22 @@
+series:
+  - name: "Siamese Bi-Encoder"
+    run_id: c721ad0478c34956b3221723d63167c9
+    mode: stage1
+    color: "#1f77b4"
+  - name: "Siamese Bi-Encoder w/ ColBERT reranking"
+    run_id: c721ad0478c34956b3221723d63167c9
+    mode: stage1_colbert_rerank
+    color: "#ff7f0e"
+  - name: "Siamese Bi-Encoder w/ trained ColBERT embeddings"
+    run_id: cc1e6cc3a91e472495b8aa21039ba0e0
+    mode: colbert
+    color: "#2ca02c"
+title_vectors: 4
+desc_vectors: 4
+image_vectors: 8
+batch_size: 128
+device: cuda
+k_max: 100
+max_queries: null
+output_dir: logs
+out_name: distance_distribution_3way.png
