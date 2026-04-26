@@ -97,6 +97,19 @@ def _metric_finalize(metrics, ks: Iterable[int]) -> Dict[str, float]:
     return out
 
 
+def _normalized_colbert_scores(model, q, d_name, d_desc, d_img, n_title: int, n_desc: int, n_img: int):
+    name_score = model.late_interaction(q["name"].to(d_name.device).unsqueeze(0), d_name) / float(
+        max(n_title, 1)
+    )
+    desc_score = model.late_interaction(q["desc"].to(d_desc.device).unsqueeze(0), d_desc) / float(
+        max(n_desc, 1)
+    )
+    img_score = model.late_interaction(q["img"].to(d_img.device).unsqueeze(0), d_img) / float(
+        max(n_img, 1)
+    )
+    return (name_score + desc_score + img_score) / 3.0
+
+
 def _get_checkpoint_path(run_id: str) -> str:
     model_dir = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="model")
     model_path = Path(model_dir)
@@ -116,16 +129,15 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         rerank_cfg = yaml.safe_load(f)
 
-    train_cfg = _load_cfg_from_run(args.mlflow_run_id)
-    if "data_path" not in train_cfg:
-        raise KeyError("Could not reconstruct train config from run params: missing data_path")
-
     tracking = os.environ.get("MLFLOW_TRACKING_URI")
     if not tracking:
         host = os.environ.get("MLFLOW_HOST", "127.0.0.1")
         port = os.environ.get("MLFLOW_PORT", "5000")
         tracking = f"http://{host}:{port}"
     mlflow.set_tracking_uri(tracking)
+    train_cfg = _load_cfg_from_run(args.mlflow_run_id)
+    if "data_path" not in train_cfg:
+        raise KeyError("Could not reconstruct train config from run params: missing data_path")
 
     checkpoint_path = _get_checkpoint_path(args.mlflow_run_id)
     data_path = Path(train_cfg["data_path"])
@@ -233,13 +245,15 @@ def main():
             d_name = torch.stack([multi_cache[sku]["name"] for sku in available]).to(device)
             d_desc = torch.stack([multi_cache[sku]["desc"] for sku in available]).to(device)
             d_img = torch.stack([multi_cache[sku]["img"] for sku in available]).to(device)
-            scores = model.colbert_score(
-                q["name"].to(device).unsqueeze(0),
-                q["desc"].to(device).unsqueeze(0),
-                q["img"].to(device).unsqueeze(0),
+            scores = _normalized_colbert_scores(
+                model,
+                q,
                 d_name,
                 d_desc,
                 d_img,
+                title_vectors,
+                desc_vectors,
+                image_vectors,
             )
             order = torch.argsort(scores, descending=True).tolist()
             reranked = [available[i] for i in order]
