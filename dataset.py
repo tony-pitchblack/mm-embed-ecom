@@ -422,6 +422,7 @@ class PairwiseDataset(Dataset):
                 "desc_second": data_second["desc_tokens"],
                 "label": torch.tensor(pair["label"], dtype=torch.float32),
                 "pair_type": pair["pair_type"],
+                "query_sku": pair["query_sku"],
             }
         return {
             "sku_first": torch.tensor(pair["sku_first"]),

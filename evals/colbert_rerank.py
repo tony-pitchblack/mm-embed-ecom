@@ -2,21 +2,23 @@ import argparse
 import ast
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Set
 
-import cv2
 import mlflow
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 import yaml
 from mlflow.tracking import MlflowClient
-from PIL import Image
 from tqdm import tqdm
 
+from evals._cache import (
+    build_siamese_colbert,
+    cache_paths,
+    load_or_build_multi,
+    load_or_build_single,
+)
 from models.siamese_clip import Tokenizers, get_transform
-from models.siamese_clip_colbert import SiameseRuCLIPColBERT
 
 
 def _convert_scalar(raw: str):
@@ -65,37 +67,6 @@ def _as_sku_list(x) -> List:
     return []
 
 
-def _load_image(image_path: str, transform):
-    img = cv2.imread(image_path)
-    if img is None:
-        return torch.zeros(3, 224, 224)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(img)
-    return transform(img)
-
-
-def _build_inputs_for_skus(
-    sku_batch: List,
-    source_indexed: pd.DataFrame,
-    images_dir: str,
-    tokenizers: Tokenizers,
-    transform,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    images = []
-    names = []
-    descriptions = []
-    for sku in sku_batch:
-        row = source_indexed.loc[sku]
-        images.append(_load_image(os.path.join(images_dir, row["image_name"]), transform))
-        names.append(str(row["name"]))
-        descriptions.append(str(row["description"]))
-    return (
-        torch.stack(images),
-        tokenizers.tokenize_name(names),
-        tokenizers.tokenize_description(descriptions),
-    )
-
-
 def _metric_update(metrics, ranked_skus: List, relevant: Set, ks: Iterable[int]):
     rel_ranks = [idx + 1 for idx, sku in enumerate(ranked_skus) if sku in relevant]
     for k in ks:
@@ -135,72 +106,11 @@ def _get_checkpoint_path(run_id: str) -> str:
     return str(candidates[-1])
 
 
-def _encode_single_vectors(
-    model: SiameseRuCLIPColBERT,
-    sku_list: List,
-    source_indexed: pd.DataFrame,
-    images_dir: str,
-    tokenizers: Tokenizers,
-    transform,
-    batch_size: int,
-    device: str,
-) -> Dict:
-    embeddings = {}
-    with torch.no_grad():
-        for start in tqdm(range(0, len(sku_list), batch_size), desc="encode_single"):
-            batch_skus = sku_list[start : start + batch_size]
-            im, name, desc = _build_inputs_for_skus(
-                batch_skus, source_indexed, images_dir, tokenizers, transform
-            )
-            im = im.to(device, non_blocking=True)
-            name = name.to(device, non_blocking=True)
-            desc = desc.to(device, non_blocking=True)
-            emb = model.get_final_embedding(im, name, desc)
-            emb = F.normalize(emb, dim=-1).cpu()
-            for sku, vec in zip(batch_skus, emb):
-                embeddings[sku] = vec
-    return embeddings
-
-
-def _encode_multi_vectors(
-    model: SiameseRuCLIPColBERT,
-    sku_list: List,
-    source_indexed: pd.DataFrame,
-    images_dir: str,
-    tokenizers: Tokenizers,
-    transform,
-    batch_size: int,
-    device: str,
-    title_vectors: int,
-    desc_vectors: int,
-    image_vectors: int,
-):
-    cache = {}
-    with torch.no_grad():
-        for start in tqdm(range(0, len(sku_list), batch_size), desc="encode_multi"):
-            batch_skus = sku_list[start : start + batch_size]
-            im, name, desc = _build_inputs_for_skus(
-                batch_skus, source_indexed, images_dir, tokenizers, transform
-            )
-            im = im.to(device, non_blocking=True)
-            name = name.to(device, non_blocking=True)
-            desc = desc.to(device, non_blocking=True)
-            img_m = model.encode_image_multi(im, image_vectors).cpu()
-            name_m = model.encode_name_multi(name, title_vectors).cpu()
-            desc_m = model.encode_description_multi(desc, desc_vectors).cpu()
-            for i, sku in enumerate(batch_skus):
-                cache[sku] = {
-                    "img": img_m[i],
-                    "name": name_m[i],
-                    "desc": desc_m[i],
-                }
-    return cache
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mlflow-run-id", required=True)
     parser.add_argument("--config", default="configs/colbert_rerank/default.yaml")
+    parser.add_argument("--force-recompute", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -235,16 +145,7 @@ def main():
     tokenizers = Tokenizers(train_cfg["name_model_name"], train_cfg["description_model_name"])
     transform = get_transform()
 
-    model = SiameseRuCLIPColBERT(
-        device=device,
-        name_model_name=train_cfg["name_model_name"],
-        description_model_name=train_cfg["description_model_name"],
-        preload_model_name=None,
-        models_dir=None,
-        dropout=train_cfg.get("dropout"),
-    )
-    state_dict = torch.load(checkpoint_path, map_location=torch.device(device), weights_only=True)
-    model.load_state_dict(state_dict)
+    model = build_siamese_colbert(train_cfg, device, checkpoint_path)
     model = model.to(device)
     model.eval()
 
@@ -256,7 +157,11 @@ def main():
     image_vectors = int(rerank_cfg["image_vectors"])
 
     catalog_skus = [sku for sku in source_df["sku"].tolist() if sku in source_indexed.index]
-    single_cache = _encode_single_vectors(
+    single_path, multi_path = cache_paths(
+        args.mlflow_run_id, title_vectors, desc_vectors, image_vectors
+    )
+    single_cache = load_or_build_single(
+        single_path,
         model,
         catalog_skus,
         source_indexed,
@@ -265,6 +170,7 @@ def main():
         transform,
         batch_size,
         device,
+        force=args.force_recompute,
     )
     catalog_skus = [sku for sku in catalog_skus if sku in single_cache]
     catalog_mat = torch.stack([single_cache[sku] for sku in catalog_skus]).to(device)
@@ -300,7 +206,8 @@ def main():
     needed_skus = set(shortlist_by_query.keys())
     for cand_list in shortlist_by_query.values():
         needed_skus.update(cand_list)
-    multi_cache = _encode_multi_vectors(
+    multi_cache = load_or_build_multi(
+        multi_path,
         model,
         sorted(needed_skus),
         source_indexed,
@@ -312,6 +219,7 @@ def main():
         title_vectors,
         desc_vectors,
         image_vectors,
+        force=args.force_recompute,
     )
 
     with torch.no_grad():
@@ -326,9 +234,9 @@ def main():
             d_desc = torch.stack([multi_cache[sku]["desc"] for sku in available]).to(device)
             d_img = torch.stack([multi_cache[sku]["img"] for sku in available]).to(device)
             scores = model.colbert_score(
-                q["name"].to(device),
-                q["desc"].to(device),
-                q["img"].to(device),
+                q["name"].to(device).unsqueeze(0),
+                q["desc"].to(device).unsqueeze(0),
+                q["img"].to(device).unsqueeze(0),
                 d_name,
                 d_desc,
                 d_img,

@@ -1,6 +1,9 @@
-from typing import Tuple
+import re
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -22,9 +25,70 @@ def _grid_for_vectors(num_vectors: int) -> Tuple[int, int]:
     return best_h, best_w
 
 
+def _compile_patterns(pats: Optional[List[str]]):
+    if not pats:
+        return []
+    return [re.compile(p) for p in pats]
+
+
 class SiameseRuCLIPColBERT(SiameseRuCLIP):
+    def __init__(
+        self,
+        device: str,
+        name_model_name: str,
+        description_model_name: str,
+        preload_model_name: Optional[str] = None,
+        models_dir: Optional[str] = None,
+        dropout: Optional[float] = None,
+        proj_dim: int = 128,
+        use_projection_heads: bool = True,
+        freeze_patterns: Optional[List[str]] = None,
+        unfreeze_patterns: Optional[List[str]] = None,
+    ):
+        super().__init__(
+            device, name_model_name, description_model_name, preload_model_name, models_dir, dropout
+        )
+        device_t = torch.device(device)
+        vision_dim = self.ruclip.visual.num_features
+        name_in = self.ruclip.transformer.config.hidden_size
+        desc_in = self.description_transformer.config.hidden_size
+        self.proj_dim = proj_dim
+        self.use_projection_heads = use_projection_heads
+        self._freeze_pats = _compile_patterns(freeze_patterns)
+        self._unfreeze_pats = _compile_patterns(unfreeze_patterns)
+        if use_projection_heads:
+            self.name_proj = nn.Linear(name_in, proj_dim, bias=True)
+            self.desc_proj = nn.Linear(desc_in, proj_dim, bias=True)
+            self.image_proj = nn.Conv2d(vision_dim, proj_dim, kernel_size=1, bias=True)
+        else:
+            self.name_proj = None
+            self.desc_proj = None
+            self.image_proj = None
+        self._colbert_logit_scale = nn.Parameter(
+            torch.tensor(float(np.log(1.0 / 0.07)), device=device_t)
+        )
+        self.apply_freeze_config()
+
+    def apply_freeze_config(self) -> None:
+        for _, p in self.named_parameters():
+            p.requires_grad = True
+        if not self._freeze_pats and not self._unfreeze_pats:
+            return
+        for name, p in self.named_parameters():
+            frozen = any(rx.search(name) for rx in self._freeze_pats) if self._freeze_pats else False
+            if self._unfreeze_pats and any(rx.search(name) for rx in self._unfreeze_pats):
+                p.requires_grad = True
+            elif frozen:
+                p.requires_grad = False
+
+    @property
+    def colbert_logit_scale_param(self) -> nn.Parameter:
+        return self._colbert_logit_scale
+
     @staticmethod
-    def _chunk_mean_pool(hidden_states: Tensor, attention_mask: Tensor, num_vectors: int) -> Tensor:
+    def _chunk_mean_pool(
+        hidden_states: Tensor, attention_mask: Tensor, num_vectors: int, normalize: bool
+    ) -> Tensor:
         if num_vectors <= 0:
             raise ValueError("num_vectors must be > 0")
         bsz, seq_len, hid = hidden_states.shape
@@ -43,11 +107,15 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
             denom = chunk_mask.sum(dim=1).clamp_min(1.0)
             chunks.append(chunk_hidden.sum(dim=1) / denom)
         pooled = torch.stack(chunks, dim=1).view(bsz, num_vectors, hid)
-        return F.normalize(pooled, dim=-1)
+        if normalize:
+            return F.normalize(pooled, dim=-1)
+        return pooled
 
     def encode_image_multi(self, image: Tensor, num_vectors: int) -> Tensor:
         h, w = _grid_for_vectors(num_vectors)
         feats = self.ruclip.visual.forward_features(image.type(self.ruclip.dtype))
+        if self.use_projection_heads and self.image_proj is not None:
+            feats = self.image_proj(feats)
         pooled = F.adaptive_avg_pool2d(feats, (h, w))
         vecs = pooled.flatten(2).transpose(1, 2).contiguous()
         return F.normalize(vecs, dim=-1)
@@ -55,14 +123,22 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
     def encode_name_multi(self, name: Tensor, num_vectors: int) -> Tensor:
         out = self.ruclip.transformer(input_ids=name[:, 0, :], attention_mask=name[:, 1, :])
         hidden = out.last_hidden_state
-        pooled = self._chunk_mean_pool(hidden, name[:, 1, :], num_vectors)
-        projected = self.ruclip.final_ln(pooled)
-        return F.normalize(projected, dim=-1)
+        mask = name[:, 1, :]
+        pooled = self._chunk_mean_pool(hidden, mask, num_vectors, normalize=False)
+        if self.use_projection_heads and self.name_proj is not None:
+            pooled = self.name_proj(pooled)
+        else:
+            pooled = self.ruclip.final_ln(pooled)
+        return F.normalize(pooled, dim=-1)
 
     def encode_description_multi(self, desc: Tensor, num_vectors: int) -> Tensor:
         out = self.description_transformer(input_ids=desc[:, 0, :], attention_mask=desc[:, 1, :])
         hidden = out.last_hidden_state
-        return self._chunk_mean_pool(hidden, desc[:, 1, :], num_vectors)
+        mask = desc[:, 1, :]
+        pooled = self._chunk_mean_pool(hidden, mask, num_vectors, normalize=False)
+        if self.use_projection_heads and self.desc_proj is not None:
+            pooled = self.desc_proj(pooled)
+        return F.normalize(pooled, dim=-1)
 
     @staticmethod
     def late_interaction(query_vectors: Tensor, doc_vectors: Tensor) -> Tensor:
@@ -70,13 +146,15 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
             query_vectors = query_vectors.unsqueeze(0)
         if doc_vectors.dim() == 2:
             doc_vectors = doc_vectors.unsqueeze(0)
-        if query_vectors.size(0) == 1:
-            sim = torch.einsum("bqd,nkd->bnqk", query_vectors, doc_vectors)
+        bq, _, d = query_vectors.shape
+        _, _, d2 = doc_vectors.shape
+        if d != d2:
+            raise ValueError("query and doc last dim must match")
+        if bq == 1:
+            sim = torch.einsum("bqd,ckd->bcqk", query_vectors, doc_vectors)
             return sim.max(dim=-1).values.sum(dim=-1).squeeze(0)
-        if query_vectors.size(0) == doc_vectors.size(0):
-            sim = torch.einsum("bqd,bkd->bqk", query_vectors, doc_vectors)
-            return sim.max(dim=-1).values.sum(dim=-1)
-        raise ValueError("query/doc batch sizes must match or query batch size must be 1")
+        sim = torch.einsum("iqd,jkd->ijqk", query_vectors, doc_vectors)
+        return sim.max(dim=-1).values.sum(dim=-1)
 
     def colbert_score(
         self,
@@ -87,7 +165,35 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
         doc_desc: Tensor,
         doc_img: Tensor,
     ) -> Tensor:
-        name_score = self.late_interaction(query_name, doc_name)
-        desc_score = self.late_interaction(query_desc, doc_desc)
-        img_score = self.late_interaction(query_img, doc_img)
-        return name_score + desc_score + img_score
+        return (
+            self.late_interaction(query_name, doc_name)
+            + self.late_interaction(query_desc, doc_desc)
+            + self.late_interaction(query_img, doc_img)
+        )
+
+    def colbert_score_matrix(
+        self,
+        q_name: Tensor,
+        q_desc: Tensor,
+        q_img: Tensor,
+        d_name: Tensor,
+        d_desc: Tensor,
+        d_img: Tensor,
+    ) -> Tensor:
+        return (
+            self.late_interaction(q_name, d_name)
+            + self.late_interaction(q_desc, d_desc)
+            + self.late_interaction(q_img, d_img)
+        )
+
+    def encode_multivectors(
+        self, im: Tensor, name: Tensor, desc: Tensor, n_title: int, n_desc: int, n_img: int
+    ) -> dict:
+        return {
+            "name": self.encode_name_multi(name, n_title),
+            "desc": self.encode_description_multi(desc, n_desc),
+            "img": self.encode_image_multi(im, n_img),
+        }
+
+    def get_final_embedding(self, im, name, desc):
+        return super().get_final_embedding(im, name, desc)

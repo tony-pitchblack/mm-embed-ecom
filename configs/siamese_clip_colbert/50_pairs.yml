@@ -1,5 +1,5 @@
 data_path: data/clip-siamese/
-model: siamese_clip
+model: siamese_clip_colbert
 repo_id: INDEEPA/clip-siamese
 source_table: tables_OZ_geo_5500/processed/OZ_geo_5500.csv
 pairwise_mapping_file: tables_OZ_geo_5500/processed/regex-pairwise-groups/regex-pairwise-groups_num-queries=20_patterns-dict-hash=a6223255f273e52a893ba7235e3c19b3/mapping.parquet
@@ -12,7 +12,7 @@ random_seed: 42
 
 pos_neg_ratio: 1.0
 hard_soft_ratio: 0.7
-limit_train_pos_pairs_per_query: 5000
+limit_train_pos_pairs_per_query: 50
 limit_val_pos_pairs_per_query: null
 limit_test_pos_pairs_per_query: null
 limit_queries: null
@@ -21,17 +21,29 @@ preload_model_name: cc12m_rubert_tiny_ep_1.pt
 name_model_name: cointegrated/rubert-tiny
 description_model_name: cointegrated/rubert-tiny
 dropout: 0.5
-contrastive_margin: 1.0
-contrastive_threshold: auto
+contrastive_margin: 1.5
+
+proj_dim: 128
+title_vectors: 4
+desc_vectors: 4
+image_vectors: 8
+use_projection_heads: true
+infonce_temperature: auto
+freeze_patterns:
+  - "ruclip\\.visual\\..*"
+  - "ruclip\\.transformer\\..*"
+  - "description_transformer\\..*"
+unfreeze_patterns:
+  - ".*\\.LayerNorm\\..*"
 
 batch_size_per_device: 160
 device: cuda
 epochs: 15
-lr: 3.0e-5
+lr: 9.0e-5
 momentum: 0.9
 weight_decay: 0.01
 scheduler_patience: 2
-best_ckpt_metric: ndcg_at_10
+best_ckpt_metric: loss
 early_stop_patience: 3
 
 mlflow_experiment: siamese/1fold

@@ -20,6 +20,7 @@ from tqdm import tqdm
 from dataset import PairwiseDataset
 from logging_config import configure_logging
 from models.siamese_clip import ContrastiveLoss, SiameseRuCLIP, Tokenizers, get_transform
+from models.siamese_clip_colbert import SiameseRuCLIPColBERT
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,157 @@ def evaluation(
     }
 
 
+def _unwrap_model(m):
+    return m.module if isinstance(m, torch.nn.DataParallel) else m
+
+
+def colbert_infonce_loss(
+    model: SiameseRuCLIPColBERT,
+    im1: torch.Tensor,
+    n1: torch.Tensor,
+    d1: torch.Tensor,
+    im2: torch.Tensor,
+    n2: torch.Tensor,
+    d2: torch.Tensor,
+    label: torch.Tensor,
+    n_title: int,
+    n_desc: int,
+    n_img: int,
+) -> torch.Tensor:
+    m = _unwrap_model(model)
+    lab = label.view(-1)
+    pos = lab < 0.5
+    scale = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0)
+    if not pos.any():
+        return (m.colbert_logit_scale_param * 0.0).sum() + 0.0 * im1.sum() * 0.0
+    pos_idx = torch.where(pos)[0]
+    a = m.encode_multivectors(
+        im1[pos_idx], n1[pos_idx], d1[pos_idx], n_title, n_desc, n_img
+    )
+    k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
+    S = m.colbert_score_matrix(
+        a["name"],
+        a["desc"],
+        a["img"],
+        k["name"],
+        k["desc"],
+        k["img"],
+    )
+    return F.cross_entropy(scale * S, pos_idx)
+
+
+def evaluation_colbert(
+    model: SiameseRuCLIPColBERT,
+    data_loader,
+    epoch,
+    device: str,
+    split_name: str,
+    n_title: int,
+    n_desc: int,
+    n_img: int,
+    mlflow_active: bool,
+) -> dict:
+    assert split_name in ("val", "test")
+    model.eval()
+    m = _unwrap_model(model)
+    if len(data_loader) == 0:
+        return {
+            "loss": 0.0,
+            "infonce_top1": 0.0,
+            "threshold": 0.0,
+            "precision": 0.0,
+            "npv": 0.0,
+            "recall": 0.0,
+            "specificity": 0.0,
+            "balanced_accuracy": 0.0,
+            "f1_score": 0.0,
+            "recall_at_5": 0.0,
+            "recall_at_10": 0.0,
+            "recall_at_100": 0.0,
+            "mrr_at_5": 0.0,
+            "mrr_at_10": 0.0,
+            "mrr_at_100": 0.0,
+            "ndcg_at_5": 0.0,
+            "ndcg_at_10": 0.0,
+            "ndcg_at_100": 0.0,
+        }
+    total_loss = 0.0
+    total_acc = 0.0
+    n_acc = 0
+    use_amp = device == "cuda"
+    amp_dtype = (
+        torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    )
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc=f"eval_{split_name}_colbert"):
+            im1 = batch["image_first"].to(device, non_blocking=True)
+            n1 = batch["name_first"].to(device, non_blocking=True)
+            d1 = batch["desc_first"].to(device, non_blocking=True)
+            im2 = batch["image_second"].to(device, non_blocking=True)
+            n2 = batch["name_second"].to(device, non_blocking=True)
+            d2 = batch["desc_second"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                loss = colbert_infonce_loss(
+                    model, im1, n1, d1, im2, n2, d2, labels, n_title, n_desc, n_img
+                )
+                lab = labels.view(-1)
+                pos = lab < 0.5
+                if pos.any():
+                    pos_idx = torch.where(pos)[0]
+                    a = m.encode_multivectors(
+                        im1[pos_idx], n1[pos_idx], d1[pos_idx], n_title, n_desc, n_img
+                    )
+                    k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
+                    S = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0) * m.colbert_score_matrix(
+                        a["name"],
+                        a["desc"],
+                        a["img"],
+                        k["name"],
+                        k["desc"],
+                        k["img"],
+                    )
+                    pred = S.argmax(dim=1)
+                    acc = (pred == pos_idx).float().mean()
+                else:
+                    acc = torch.tensor(0.0, device=device)
+            total_loss += loss.item()
+            if pos.any():
+                total_acc += acc.item()
+                n_acc += 1
+    avg_loss = total_loss / max(len(data_loader), 1)
+    avg_acc = total_acc / max(n_acc, 1)
+    rank_metrics = {
+        "recall_at_5": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_100": 0.0,
+        "mrr_at_5": 0.0,
+        "mrr_at_10": 0.0,
+        "mrr_at_100": 0.0,
+        "ndcg_at_5": 0.0,
+        "ndcg_at_10": 0.0,
+        "ndcg_at_100": 0.0,
+    }
+    if mlflow_active:
+        prefix = f"{split_name}/"
+        step = int(epoch) if isinstance(epoch, int) else 0
+        kw = dict(step=step) if split_name == "val" else {}
+        mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
+        mlflow.log_metric(f"{prefix}infonce_top1", avg_acc, **kw)
+    return {
+        "loss": avg_loss,
+        "infonce_top1": avg_acc,
+        "threshold": 0.0,
+        "precision": 0.0,
+        "npv": 0.0,
+        "recall": 0.0,
+        "specificity": 0.0,
+        "balanced_accuracy": 0.0,
+        "f1_score": 0.0,
+        **rank_metrics,
+    }
+
+
 def train_with_threshold_tracking(
     model,
     optimizer,
@@ -437,6 +589,153 @@ def train_with_threshold_tracking(
     return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
 
 
+def train_with_colbert_infonce(
+    model,
+    optimizer,
+    epochs_num,
+    train_loader,
+    valid_loader,
+    device,
+    models_dir,
+    train_stats,
+    scheduler_patience,
+    ckpt_ppq,
+    ckpt_pnr,
+    ckpt_hsr,
+    mlflow_active,
+    best_ckpt_metric,
+    early_stop_patience,
+    n_title,
+    n_desc,
+    n_img,
+):
+    model.to(device)
+    train_losses, val_losses = [], []
+    maximize = best_ckpt_metric in (
+        "infonce_top1",
+        "recall_at_5",
+        "recall_at_10",
+        "recall_at_100",
+        "mrr_at_5",
+        "mrr_at_10",
+        "mrr_at_100",
+        "ndcg_at_5",
+        "ndcg_at_10",
+        "ndcg_at_100",
+    )
+    best_valid_metric = float("-inf") if maximize else float("inf")
+    best_threshold = None
+    best_weights = None
+    best_val_loss = float("inf")
+    epochs_since_loss_improved = 0
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="max" if maximize else "min",
+        factor=0.1,
+        patience=scheduler_patience,
+        threshold=1e-4,
+        threshold_mode="rel",
+    )
+    use_amp = device == "cuda"
+    amp_dtype = (
+        torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+    probe_steps = int(os.environ.get("PROBE_STEPS", "0") or "0")
+    probe_step_count = 0
+    if models_dir:
+        Path(models_dir).mkdir(parents=True, exist_ok=True)
+    for epoch in range(1, epochs_num + 1):
+        model.train()
+        total_train_loss = 0.0
+        for batch in tqdm(train_loader, desc=f"train_ep{epoch}_colbert"):
+            im1 = batch["image_first"].to(device, non_blocking=True)
+            n1 = batch["name_first"].to(device, non_blocking=True)
+            d1 = batch["desc_first"].to(device, non_blocking=True)
+            im2 = batch["image_second"].to(device, non_blocking=True)
+            n2 = batch["name_second"].to(device, non_blocking=True)
+            d2 = batch["desc_second"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                loss = colbert_infonce_loss(
+                    model, im1, n1, d1, im2, n2, d2, labels, n_title, n_desc, n_img
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_train_loss += loss.item()
+            if probe_steps > 0:
+                probe_step_count += 1
+                if probe_step_count >= probe_steps:
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                        peak_mib = torch.cuda.max_memory_allocated() // (1024 * 1024)
+                        reserved_mib = torch.cuda.max_memory_reserved() // (1024 * 1024)
+                    else:
+                        peak_mib = 0
+                        reserved_mib = 0
+                    print(
+                        f"PROBE_RESULT peak_mib={peak_mib} reserved_mib={reserved_mib} "
+                        f"bs={im1.size(0)}",
+                        flush=True,
+                    )
+                    sys.exit(0)
+        train_losses.append(total_train_loss / max(len(train_loader), 1))
+        if valid_loader is not None:
+            val_metrics = evaluation_colbert(
+                model,
+                valid_loader,
+                epoch,
+                device=device,
+                split_name="val",
+                n_title=n_title,
+                n_desc=n_desc,
+                n_img=n_img,
+                mlflow_active=mlflow_active,
+            )
+            val_losses.append(val_metrics["loss"])
+            if best_ckpt_metric not in val_metrics:
+                raise KeyError(
+                    f"best_ckpt_metric={best_ckpt_metric!r} not in val metrics: "
+                    f"{sorted(val_metrics)}"
+                )
+            cur_metric = val_metrics[best_ckpt_metric]
+            scheduler.step(cur_metric)
+            improved = cur_metric < best_valid_metric if not maximize else cur_metric > best_valid_metric
+            if improved:
+                best_valid_metric = cur_metric
+                best_threshold = val_metrics.get("threshold")
+                sd = (
+                    model.module.state_dict()
+                    if isinstance(model, torch.nn.DataParallel)
+                    else model.state_dict()
+                )
+                best_weights = {k: v.detach().cpu().clone() for k, v in sd.items()}
+                if models_dir:
+                    metric_tag = best_ckpt_metric.replace("/", "-")
+                    checkpoint_filename = (
+                        f"siamese_colbert_infonce_val_ep{epoch}_{metric_tag}-{cur_metric:.3f}_"
+                        f"top1-{val_metrics['infonce_top1']:.3f}_"
+                        f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
+                        f"ppq{ckpt_ppq}_pnr{ckpt_pnr}_hsr{ckpt_hsr}.pt"
+                    )
+                    torch.save(best_weights, Path(models_dir) / checkpoint_filename)
+            if val_metrics["loss"] < best_val_loss - 1e-4:
+                best_val_loss = val_metrics["loss"]
+                epochs_since_loss_improved = 0
+            else:
+                epochs_since_loss_improved += 1
+                if early_stop_patience is not None and epochs_since_loss_improved >= early_stop_patience:
+                    logger.info(
+                        "early stop: val/loss did not improve for %d epochs (best=%.4f)",
+                        early_stop_patience,
+                        best_val_loss,
+                    )
+                    break
+    return train_losses, val_losses, best_valid_metric, best_weights, best_threshold
+
+
 def get_optimal_num_workers():
     import psutil
 
@@ -557,68 +856,128 @@ def main():
         loaders[split_name] = DataLoader(ds, **dl_kw)
         logger.debug("DataLoader %s: %d batches/epoch", split_name, len(loaders[split_name]))
     num_gpus = torch.cuda.device_count()
-    logger.debug("building SiameseRuCLIP (download/load weights if needed) …")
-    model = SiameseRuCLIP(
-        device,
-        cfg["name_model_name"],
-        cfg["description_model_name"],
-        cfg.get("preload_model_name"),
-        models_dir_preload,
-        cfg.get("dropout"),
-    )
-    logger.debug("SiameseRuCLIP built")
+    mkey = str(cfg.get("model", "siamese_clip"))
+    if mkey == "siamese_clip_colbert":
+        logger.debug("building SiameseRuCLIPColBERT (download/load weights if needed) …")
+        model = SiameseRuCLIPColBERT(
+            device,
+            cfg["name_model_name"],
+            cfg["description_model_name"],
+            cfg.get("preload_model_name"),
+            models_dir_preload if cfg.get("preload_model_name") else None,
+            cfg.get("dropout"),
+            int(cfg.get("proj_dim", 128)),
+            bool(cfg.get("use_projection_heads", True)),
+            cfg.get("freeze_patterns"),
+            cfg.get("unfreeze_patterns"),
+        )
+        n_title = int(cfg["title_vectors"])
+        n_desc = int(cfg["desc_vectors"])
+        n_img = int(cfg["image_vectors"])
+        m0 = model
+        n_train = sum(p.numel() for p in m0.parameters() if p.requires_grad)
+        logger.info("ColBERT trainable parameters: %d", n_train)
+    else:
+        logger.debug("building SiameseRuCLIP (download/load weights if needed) …")
+        model = SiameseRuCLIP(
+            device,
+            cfg["name_model_name"],
+            cfg["description_model_name"],
+            cfg.get("preload_model_name"),
+            models_dir_preload,
+            cfg.get("dropout"),
+        )
+        n_title, n_desc, n_img = 0, 0, 0
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)
-    criterion = ContrastiveLoss(margin=cfg["contrastive_margin"]).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    if mkey == "siamese_clip_colbert":
+        core = model.module if isinstance(model, torch.nn.DataParallel) else model
+        trainable = [p for p in core.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+        criterion = None
+    else:
+        criterion = ContrastiveLoss(margin=cfg["contrastive_margin"]).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    logger.debug("model built, type=%s", mkey)
     tmp_ckpt = results_root / "tmp"
     tmp_ckpt.mkdir(parents=True, exist_ok=True)
     run_ctx = mlflow.start_run() if mlflow_active else None
     try:
         if mlflow_active:
             mlflow.log_params({k: str(v) for k, v in cfg.items() if isinstance(v, (int, float, str))})
-        best_ckpt_metric = cfg.get("best_ckpt_metric", "ndcg_at_10")
-        early_stop_patience = cfg.get("early_stop_patience")
-        thr_cfg = cfg.get("contrastive_threshold", "auto")
-        if isinstance(thr_cfg, str) and thr_cfg.lower() == "auto":
+        if mkey == "siamese_clip_colbert":
+            best_ckpt_metric = cfg.get("best_ckpt_metric", "loss")
+            early_stop_patience = cfg.get("early_stop_patience")
+            thr_cfg = "auto"
             contrastive_threshold = None
         else:
-            contrastive_threshold = float(thr_cfg)
+            best_ckpt_metric = cfg.get("best_ckpt_metric", "ndcg_at_10")
+            early_stop_patience = cfg.get("early_stop_patience")
+            thr_cfg = cfg.get("contrastive_threshold", "auto")
+            if isinstance(thr_cfg, str) and thr_cfg.lower() == "auto":
+                contrastive_threshold = None
+            else:
+                contrastive_threshold = float(thr_cfg)
         logger.debug(
-            "entering training: epochs=%d, best_ckpt_metric=%s, early_stop_patience=%s, contrastive_threshold=%s",
+            "entering training: model=%s, epochs=%d, best_ckpt_metric=%s, early_stop_patience=%s, contrastive_threshold=%s",
+            mkey,
             cfg["epochs"],
             best_ckpt_metric,
             early_stop_patience,
             "auto" if contrastive_threshold is None else contrastive_threshold,
         )
-        train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
-            train_with_threshold_tracking(
-                model,
-                optimizer,
-                criterion,
-                cfg["epochs"],
-                loaders["train"],
-                loaders["val"],
-                device,
-                str(tmp_ckpt),
-                source_df,
-                images_dir,
-                True,
-                train_stats,
-                cfg["scheduler_patience"],
-                cfg["contrastive_margin"],
-                cfg["limit_train_pos_pairs_per_query"],
-                cfg["pos_neg_ratio"],
-                cfg["hard_soft_ratio"],
-                mlflow_active,
-                cfg["name_model_name"],
-                cfg["description_model_name"],
-                best_ckpt_metric,
-                early_stop_patience,
-                contrastive_threshold,
+        if mkey == "siamese_clip_colbert":
+            train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
+                train_with_colbert_infonce(
+                    model,
+                    optimizer,
+                    cfg["epochs"],
+                    loaders["train"],
+                    loaders["val"],
+                    device,
+                    str(tmp_ckpt),
+                    train_stats,
+                    cfg["scheduler_patience"],
+                    cfg["limit_train_pos_pairs_per_query"],
+                    cfg["pos_neg_ratio"],
+                    cfg["hard_soft_ratio"],
+                    mlflow_active,
+                    best_ckpt_metric,
+                    early_stop_patience,
+                    n_title,
+                    n_desc,
+                    n_img,
+                )
             )
-        )
+        else:
+            train_losses, val_losses, best_metric_val, best_weights, best_threshold = (
+                train_with_threshold_tracking(
+                    model,
+                    optimizer,
+                    criterion,
+                    cfg["epochs"],
+                    loaders["train"],
+                    loaders["val"],
+                    device,
+                    str(tmp_ckpt),
+                    source_df,
+                    images_dir,
+                    True,
+                    train_stats,
+                    cfg["scheduler_patience"],
+                    cfg["contrastive_margin"],
+                    cfg["limit_train_pos_pairs_per_query"],
+                    cfg["pos_neg_ratio"],
+                    cfg["hard_soft_ratio"],
+                    mlflow_active,
+                    cfg["name_model_name"],
+                    cfg["description_model_name"],
+                    best_ckpt_metric,
+                    early_stop_patience,
+                    contrastive_threshold,
+                )
+            )
         if best_weights is None:
             raise RuntimeError("No validation improvement; best_weights is None")
         if len(train_losses) >= 2 and mlflow_active:
@@ -632,32 +991,52 @@ def main():
             model.module.load_state_dict(best_weights)
         else:
             model.load_state_dict(best_weights)
-        test_metrics = evaluation(
-            model,
-            criterion,
-            loaders["test"],
-            0,
-            device=device,
-            split_name="test",
-            threshold=best_threshold,
-            margin=cfg["contrastive_margin"],
-            steps=200,
-            source_df=source_df,
-            images_dir=images_dir,
-            precompute_pairs=True,
-            mlflow_active=mlflow_active,
-            name_model_name=cfg["name_model_name"],
-            description_model_name=cfg["description_model_name"],
-        )
-        metric_tag = best_ckpt_metric.replace("/", "-")
-        filename = (
-            f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
-            f"f1-{test_metrics['f1_score']:.3f}_precision-{test_metrics['precision']:.3f}_"
-            f"recall-{test_metrics['recall']:.3f}_specificity-{test_metrics['specificity']:.3f}_"
-            f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
-            f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}_"
-            f"thr{best_threshold:.3f}.pt"
-        )
+        if mkey == "siamese_clip_colbert":
+            test_metrics = evaluation_colbert(
+                model,
+                loaders["test"],
+                0,
+                device=device,
+                split_name="test",
+                n_title=n_title,
+                n_desc=n_desc,
+                n_img=n_img,
+                mlflow_active=mlflow_active,
+            )
+            metric_tag = best_ckpt_metric.replace("/", "-")
+            filename = (
+                f"siamese_colbert_infonce_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
+                f"top1-{test_metrics['infonce_top1']:.3f}_"
+                f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
+                f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}.pt"
+            )
+        else:
+            test_metrics = evaluation(
+                model,
+                criterion,
+                loaders["test"],
+                0,
+                device=device,
+                split_name="test",
+                threshold=best_threshold,
+                margin=cfg["contrastive_margin"],
+                steps=200,
+                source_df=source_df,
+                images_dir=images_dir,
+                precompute_pairs=True,
+                mlflow_active=mlflow_active,
+                name_model_name=cfg["name_model_name"],
+                description_model_name=cfg["description_model_name"],
+            )
+            metric_tag = best_ckpt_metric.replace("/", "-")
+            filename = (
+                f"siamese_contrastive_soft-neg_test_ep{cfg['epochs']}_{metric_tag}-{test_metrics[best_ckpt_metric]:.3f}_"
+                f"f1-{test_metrics['f1_score']:.3f}_precision-{test_metrics['precision']:.3f}_"
+                f"recall-{test_metrics['recall']:.3f}_specificity-{test_metrics['specificity']:.3f}_"
+                f"pos{train_stats['positives']}_hard{train_stats['hard_negatives']}_soft{train_stats['soft_negatives']}_"
+                f"ppq{cfg['limit_train_pos_pairs_per_query']}_pnr{cfg['pos_neg_ratio']}_hsr{cfg['hard_soft_ratio']}_"
+                f"thr{best_threshold:.3f}.pt"
+            )
         final_path = results_root / filename
         final_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(best_weights, final_path)

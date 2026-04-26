@@ -1,4 +1,5 @@
 data_path: data/clip-siamese/
+model: siamese_clip
 repo_id: INDEEPA/clip-siamese
 source_table: tables_OZ_geo_5500/processed/OZ_geo_5500.csv
 pairwise_mapping_file: tables_OZ_geo_5500/processed/regex-pairwise-groups/regex-pairwise-groups_num-queries=20_patterns-dict-hash=a6223255f273e52a893ba7235e3c19b3/mapping.parquet

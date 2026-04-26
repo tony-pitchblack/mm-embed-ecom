@@ -11,49 +11,19 @@ import torch
 import yaml
 from tqdm import tqdm
 
+from evals._cache import (
+    build_siamese_colbert,
+    cache_paths,
+    load_or_build_multi,
+    load_or_build_single,
+)
 from evals.colbert_rerank import (
     _as_sku_list,
-    _encode_multi_vectors,
-    _encode_single_vectors,
     _get_checkpoint_path,
     _load_cfg_from_run,
     _processed_root,
 )
 from models.siamese_clip import Tokenizers, get_transform
-from models.siamese_clip_colbert import SiameseRuCLIPColBERT
-
-
-CACHE_ROOT = Path("data/cache/embeddings")
-
-
-def _cache_paths(run_id: str, title_v: int, desc_v: int, image_v: int) -> Tuple[Path, Path]:
-    run_dir = CACHE_ROOT / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir / "single.pt", run_dir / f"multi_t{title_v}_d{desc_v}_i{image_v}.pt"
-
-
-def _load_or_build_single(path, model, sku_list, source_indexed, images_dir,
-                          tokenizers, transform, batch_size, device):
-    if path.exists():
-        return torch.load(path, map_location="cpu", weights_only=False)
-    cache = _encode_single_vectors(
-        model, sku_list, source_indexed, images_dir, tokenizers, transform, batch_size, device
-    )
-    torch.save(cache, path)
-    return cache
-
-
-def _load_or_build_multi(path, model, sku_list, source_indexed, images_dir,
-                         tokenizers, transform, batch_size, device,
-                         title_v, desc_v, image_v):
-    if path.exists():
-        return torch.load(path, map_location="cpu", weights_only=False)
-    cache = _encode_multi_vectors(
-        model, sku_list, source_indexed, images_dir, tokenizers, transform,
-        batch_size, device, title_v, desc_v, image_v,
-    )
-    torch.save(cache, path)
-    return cache
 
 
 def _collect_per_query(
@@ -61,7 +31,7 @@ def _collect_per_query(
     catalog_skus: List,
     single_cache: Dict,
     multi_cache: Dict,
-    model: SiameseRuCLIPColBERT,
+    model,
     device: str,
     k_max: int,
 ):
@@ -90,7 +60,7 @@ def _collect_per_query(
             qd = multi_cache[q]["desc"].to(device)
             qi = multi_cache[q]["img"].to(device)
             s2 = model.colbert_score(
-                qn, qd, qi,
+                qn.unsqueeze(0), qd.unsqueeze(0), qi.unsqueeze(0),
                 d_name[top_idx], d_desc[top_idx], d_img[top_idx],
             ).cpu().numpy()
 
@@ -176,6 +146,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mlflow-run-id", required=True)
     parser.add_argument("--config", default="configs/distance_distribution/default.yaml")
+    parser.add_argument("--force-recompute", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -214,30 +185,21 @@ def main():
     tokenizers = Tokenizers(train_cfg["name_model_name"], train_cfg["description_model_name"])
     transform = get_transform()
 
-    model = SiameseRuCLIPColBERT(
-        device=device,
-        name_model_name=train_cfg["name_model_name"],
-        description_model_name=train_cfg["description_model_name"],
-        preload_model_name=None,
-        models_dir=None,
-        dropout=train_cfg.get("dropout"),
-    )
-    checkpoint_path = _get_checkpoint_path(args.mlflow_run_id)
-    state_dict = torch.load(checkpoint_path, map_location=torch.device(device), weights_only=True)
-    model.load_state_dict(state_dict)
+    model = build_siamese_colbert(train_cfg, device, _get_checkpoint_path(args.mlflow_run_id))
     model = model.to(device)
     model.eval()
 
     catalog_skus_all = [sku for sku in source_df["sku"].tolist() if sku in source_indexed.index]
 
-    single_path, multi_path = _cache_paths(args.mlflow_run_id, title_v, desc_v, image_v)
-    single_cache = _load_or_build_single(
+    single_path, multi_path = cache_paths(args.mlflow_run_id, title_v, desc_v, image_v)
+    single_cache = load_or_build_single(
         single_path, model, catalog_skus_all, source_indexed, images_dir,
-        tokenizers, transform, batch_size, device,
+        tokenizers, transform, batch_size, device, force=args.force_recompute,
     )
-    multi_cache = _load_or_build_multi(
+    multi_cache = load_or_build_multi(
         multi_path, model, catalog_skus_all, source_indexed, images_dir,
         tokenizers, transform, batch_size, device, title_v, desc_v, image_v,
+        force=args.force_recompute,
     )
 
     catalog_skus = [sku for sku in catalog_skus_all if sku in single_cache and sku in multi_cache]
