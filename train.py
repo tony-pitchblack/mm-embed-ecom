@@ -240,7 +240,7 @@ def evaluation(
     if mlflow_active:
         prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
-        kw = dict(step=step) if split_name == "val" else {}
+        kw = dict(step=step)
         mlflow.log_metric(f"{prefix}threshold", float(best_thr), **kw)
         mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
         mlflow.log_metric(f"{prefix}precision", precision, **kw)
@@ -348,6 +348,8 @@ def evaluation_colbert(
     total_loss = 0.0
     total_acc = 0.0
     n_acc = 0
+    all_scores, all_lbl = [], []
+    all_query = []
     use_amp = device == "cuda"
     amp_dtype = (
         torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
@@ -361,27 +363,30 @@ def evaluation_colbert(
             n2 = batch["name_second"].to(device, non_blocking=True)
             d2 = batch["desc_second"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
+            q = batch["query_sku"]
+            if isinstance(q, torch.Tensor):
+                all_query.extend(q.detach().cpu().tolist())
+            else:
+                all_query.extend(list(q))
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 loss = colbert_infonce_loss(
                     model, im1, n1, d1, im2, n2, d2, labels, n_title, n_desc, n_img
+                )
+                a_all = m.encode_multivectors(im1, n1, d1, n_title, n_desc, n_img)
+                k_all = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
+                S_all = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0) * m.colbert_score_matrix(
+                    a_all["name"],
+                    a_all["desc"],
+                    a_all["img"],
+                    k_all["name"],
+                    k_all["desc"],
+                    k_all["img"],
                 )
                 lab = labels.view(-1)
                 pos = lab < 0.5
                 if pos.any():
                     pos_idx = torch.where(pos)[0]
-                    a = m.encode_multivectors(
-                        im1[pos_idx], n1[pos_idx], d1[pos_idx], n_title, n_desc, n_img
-                    )
-                    k = m.encode_multivectors(im2, n2, d2, n_title, n_desc, n_img)
-                    S = m.colbert_logit_scale_param.exp().clamp(1.0, 100.0) * m.colbert_score_matrix(
-                        a["name"],
-                        a["desc"],
-                        a["img"],
-                        k["name"],
-                        k["desc"],
-                        k["img"],
-                    )
-                    pred = S.argmax(dim=1)
+                    pred = S_all[pos_idx].argmax(dim=1)
                     acc = (pred == pos_idx).float().mean()
                 else:
                     acc = torch.tensor(0.0, device=device)
@@ -389,6 +394,8 @@ def evaluation_colbert(
             if pos.any():
                 total_acc += acc.item()
                 n_acc += 1
+            all_scores.append(torch.diagonal(S_all).detach().float().cpu())
+            all_lbl.append(labels.detach().cpu())
     avg_loss = total_loss / max(len(data_loader), 1)
     avg_acc = total_acc / max(n_acc, 1)
     rank_metrics = {
@@ -402,12 +409,66 @@ def evaluation_colbert(
         "ndcg_at_10": 0.0,
         "ndcg_at_100": 0.0,
     }
+    if all_query:
+        score_np = torch.cat(all_scores).numpy()
+        lbl_np = torch.cat(all_lbl).numpy()
+        query_np = np.array(all_query)
+        ks = (5, 10, 100)
+        recalls_by_k = {k: [] for k in ks}
+        mrr_by_k = {k: [] for k in ks}
+        ndcg_by_k = {k: [] for k in ks}
+        for query_id in np.unique(query_np):
+            mask = query_np == query_id
+            query_scores = score_np[mask]
+            query_lbl = lbl_np[mask]
+            total_relevant = int((query_lbl == 0).sum())
+            if total_relevant <= 0:
+                continue
+            order = np.argsort(-query_scores)
+            ranked_lbl = query_lbl[order]
+            relevance = (ranked_lbl == 0).astype(np.int32)
+            positive_idx = np.where(relevance == 1)[0]
+            for k in ks:
+                topk_rel = relevance[:k]
+                hits_k = int(topk_rel.sum())
+                recalls_by_k[k].append(float(hits_k / total_relevant))
+                rr_k = 0.0
+                if positive_idx.size > 0:
+                    first_rank = int(positive_idx[0]) + 1
+                    if first_rank <= k:
+                        rr_k = 1.0 / float(first_rank)
+                mrr_by_k[k].append(rr_k)
+                if hits_k == 0:
+                    ndcg_by_k[k].append(0.0)
+                else:
+                    gains = topk_rel / np.log2(np.arange(2, len(topk_rel) + 2))
+                    dcg_k = float(gains.sum())
+                    ideal_len = min(total_relevant, k)
+                    ideal_rel = np.ones(ideal_len, dtype=np.float32)
+                    idcg_k = float((ideal_rel / np.log2(np.arange(2, ideal_len + 2))).sum())
+                    ndcg_by_k[k].append(float(dcg_k / idcg_k) if idcg_k > 0 else 0.0)
+        for k in ks:
+            if recalls_by_k[k]:
+                rank_metrics[f"recall_at_{k}"] = float(np.mean(recalls_by_k[k]))
+            if mrr_by_k[k]:
+                rank_metrics[f"mrr_at_{k}"] = float(np.mean(mrr_by_k[k]))
+            if ndcg_by_k[k]:
+                rank_metrics[f"ndcg_at_{k}"] = float(np.mean(ndcg_by_k[k]))
     if mlflow_active:
         prefix = f"{split_name}/"
         step = int(epoch) if isinstance(epoch, int) else 0
-        kw = dict(step=step) if split_name == "val" else {}
+        kw = dict(step=step)
         mlflow.log_metric(f"{prefix}loss", avg_loss, **kw)
         mlflow.log_metric(f"{prefix}infonce_top1", avg_acc, **kw)
+        mlflow.log_metric(f"{prefix}recall_at_5", rank_metrics["recall_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}recall_at_10", rank_metrics["recall_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}recall_at_100", rank_metrics["recall_at_100"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_5", rank_metrics["mrr_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_10", rank_metrics["mrr_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}mrr_at_100", rank_metrics["mrr_at_100"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_5", rank_metrics["ndcg_at_5"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_10", rank_metrics["ndcg_at_10"], **kw)
+        mlflow.log_metric(f"{prefix}ndcg_at_100", rank_metrics["ndcg_at_100"], **kw)
     return {
         "loss": avg_loss,
         "infonce_top1": avg_acc,
@@ -991,11 +1052,12 @@ def main():
             model.module.load_state_dict(best_weights)
         else:
             model.load_state_dict(best_weights)
+        final_eval_step = max(1, len(train_losses))
         if mkey == "siamese_clip_colbert":
             test_metrics = evaluation_colbert(
                 model,
                 loaders["test"],
-                0,
+                final_eval_step,
                 device=device,
                 split_name="test",
                 n_title=n_title,
@@ -1015,7 +1077,7 @@ def main():
                 model,
                 criterion,
                 loaders["test"],
-                0,
+                final_eval_step,
                 device=device,
                 split_name="test",
                 threshold=best_threshold,
