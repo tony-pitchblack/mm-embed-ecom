@@ -10,4 +10,5 @@ logs/
 
 data/
 papers/
-.gitattributes/ # for HF repo unpacked in root
+# HF repo unpacked in root
+.gitattributes
