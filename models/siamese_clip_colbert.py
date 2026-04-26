@@ -31,7 +31,14 @@ def _compile_patterns(pats: Optional[List[str]]):
     return [re.compile(p) for p in pats]
 
 
-class SiameseRuCLIPColBERT(SiameseRuCLIP):
+class SiameseRuCLIPColBERTWithHead(SiameseRuCLIP):
+    """ColBERT multi-vector model that retains the inherited single-vector head.
+
+    Use as a wrapper around regular Siamese checkpoints to evaluate them with
+    ColBERT-style reranking on top of final-embedding retrieval. The ColBERT
+    projection heads here are untrained when loaded from a regular checkpoint.
+    """
+
     def __init__(
         self,
         device: str,
@@ -179,21 +186,6 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
             + self.late_interaction(query_img, doc_img)
         )
 
-    def colbert_score_matrix(
-        self,
-        q_name: Tensor,
-        q_desc: Tensor,
-        q_img: Tensor,
-        d_name: Tensor,
-        d_desc: Tensor,
-        d_img: Tensor,
-    ) -> Tensor:
-        return (
-            self.late_interaction(q_name, d_name)
-            + self.late_interaction(q_desc, d_desc)
-            + self.late_interaction(q_img, d_img)
-        )
-
     def encode_multivectors(
         self, im: Tensor, name: Tensor, desc: Tensor, n_title: int, n_desc: int, n_img: int
     ) -> dict:
@@ -203,5 +195,27 @@ class SiameseRuCLIPColBERT(SiameseRuCLIP):
             "img": self.encode_image_multi(im, n_img),
         }
 
-    def get_final_embedding(self, im, name, desc):
-        return super().get_final_embedding(im, name, desc)
+
+class SiameseRuCLIPColBERT(SiameseRuCLIPColBERTWithHead):
+    """Pure ColBERT multi-vector model. Does NOT support single-vector final embedding.
+
+    Use for models trained with the ColBERT objective.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if hasattr(self, "head"):
+            del self.head
+        self.hidden_dim = None
+
+    def get_final_embedding(self, *args, **kwargs):
+        raise NotImplementedError(
+            "SiameseRuCLIPColBERT does not support get_final_embedding; "
+            "use SiameseRuCLIPColBERTWithHead for models with a trained bi-encoder head."
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "SiameseRuCLIPColBERT does not support pairwise forward; "
+            "use encode_multivectors + late_interaction."
+        )

@@ -97,7 +97,9 @@ def _metric_finalize(metrics, ks: Iterable[int]) -> Dict[str, float]:
     return out
 
 
-def _normalized_colbert_scores(model, q, d_name, d_desc, d_img, n_title: int, n_desc: int, n_img: int):
+def _normalized_colbert_pair_scores(
+    model, q, d_name, d_desc, d_img, n_title: int, n_desc: int, n_img: int
+):
     name_score = model.late_interaction(q["name"].to(d_name.device).unsqueeze(0), d_name) / float(
         max(n_title, 1)
     )
@@ -119,6 +121,27 @@ def _get_checkpoint_path(run_id: str) -> str:
     return str(candidates[-1])
 
 
+def _stage1_final_emb(single_cache, catalog_skus, catalog_mat, query_sku, k_max, device):
+    q_vec = single_cache[query_sku].to(device)
+    dists = torch.norm(catalog_mat - q_vec.unsqueeze(0), dim=1)
+    order = torch.argsort(dists, descending=False).tolist()
+    ranked = [catalog_skus[i] for i in order if catalog_skus[i] != query_sku]
+    return ranked[:k_max]
+
+
+def _stage1_colbert_full(
+    model, multi_cache, catalog_skus, d_name, d_desc, d_img, query_sku,
+    k_max, n_title, n_desc, n_img, device,
+):
+    q = multi_cache[query_sku]
+    scores = _normalized_colbert_pair_scores(
+        model, q, d_name, d_desc, d_img, n_title, n_desc, n_img
+    )
+    order = torch.argsort(scores, descending=True).tolist()
+    ranked = [catalog_skus[i] for i in order if catalog_skus[i] != query_sku]
+    return ranked[:k_max]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mlflow-run-id", required=True)
@@ -138,6 +161,9 @@ def main():
     train_cfg = _load_cfg_from_run(args.mlflow_run_id)
     if "data_path" not in train_cfg:
         raise KeyError("Could not reconstruct train config from run params: missing data_path")
+
+    mkey = str(train_cfg.get("model", "siamese_clip"))
+    is_colbert_trained = mkey == "siamese_clip_colbert"
 
     checkpoint_path = _get_checkpoint_path(args.mlflow_run_id)
     data_path = Path(train_cfg["data_path"])
@@ -172,94 +198,78 @@ def main():
     single_path, multi_path = cache_paths(
         args.mlflow_run_id, title_vectors, desc_vectors, image_vectors
     )
-    single_cache = load_or_build_single(
-        single_path,
-        model,
-        catalog_skus,
-        source_indexed,
-        images_dir,
-        tokenizers,
-        transform,
-        batch_size,
-        device,
-        force=args.force_recompute,
+
+    multi_cache = load_or_build_multi(
+        multi_path, model, catalog_skus, source_indexed, images_dir,
+        tokenizers, transform, batch_size, device,
+        title_vectors, desc_vectors, image_vectors, force=args.force_recompute,
     )
-    catalog_skus = [sku for sku in catalog_skus if sku in single_cache]
-    catalog_mat = torch.stack([single_cache[sku] for sku in catalog_skus]).to(device)
+    catalog_skus = [sku for sku in catalog_skus if sku in multi_cache]
+
+    if is_colbert_trained:
+        single_cache = None
+        catalog_mat = None
+    else:
+        single_cache = load_or_build_single(
+            single_path, model, catalog_skus, source_indexed, images_dir,
+            tokenizers, transform, batch_size, device, force=args.force_recompute,
+        )
+        catalog_skus = [sku for sku in catalog_skus if sku in single_cache]
+        catalog_mat = torch.stack([single_cache[sku] for sku in catalog_skus]).to(device)
+
+    d_name = torch.stack([multi_cache[sku]["name"] for sku in catalog_skus]).to(device)
+    d_desc = torch.stack([multi_cache[sku]["desc"] for sku in catalog_skus]).to(device)
+    d_img = torch.stack([multi_cache[sku]["img"] for sku in catalog_skus]).to(device)
 
     grouped = test_df.groupby("sku_query", sort=False).first().reset_index()
-    baseline_acc = {m: {k: [] for k in ks} for m in ("recall", "mrr", "ndcg")}
+
+    stage1_acc = {m: {k: [] for k in ks} for m in ("recall", "mrr", "ndcg")}
     rerank_acc = {m: {k: [] for k in ks} for m in ("recall", "mrr", "ndcg")}
-    shortlist_by_query = {}
-    relevant_by_query = {}
 
     with torch.no_grad():
-        for _, row in tqdm(grouped.iterrows(), total=len(grouped), desc="stage1_retrieval"):
+        for _, row in tqdm(grouped.iterrows(), total=len(grouped), desc="eval"):
             query_sku = row["sku_query"]
-            if query_sku not in single_cache:
+            if query_sku not in multi_cache:
+                continue
+            if not is_colbert_trained and query_sku not in single_cache:
                 continue
             relevant = set(_as_sku_list(row["sku_pos"]))
             relevant.discard(query_sku)
             if not relevant:
                 continue
-            q_vec = single_cache[query_sku].to(device)
-            dists = torch.norm(catalog_mat - q_vec.unsqueeze(0), dim=1)
-            order = torch.argsort(dists, descending=False).tolist()
-            ranked = [catalog_skus[i] for i in order if catalog_skus[i] != query_sku]
-            ranked = ranked[:k_max]
-            if not ranked:
-                continue
-            shortlist_by_query[query_sku] = ranked
-            relevant_by_query[query_sku] = relevant
-            _metric_update(baseline_acc, ranked, relevant, ks)
 
-    baseline_metrics = _metric_finalize(baseline_acc, ks)
+            if is_colbert_trained:
+                ranked = _stage1_colbert_full(
+                    model, multi_cache, catalog_skus, d_name, d_desc, d_img,
+                    query_sku, k_max, title_vectors, desc_vectors, image_vectors, device,
+                )
+                if not ranked:
+                    continue
+                _metric_update(stage1_acc, ranked, relevant, ks)
+            else:
+                ranked = _stage1_final_emb(
+                    single_cache, catalog_skus, catalog_mat, query_sku, k_max, device
+                )
+                if not ranked:
+                    continue
+                _metric_update(stage1_acc, ranked, relevant, ks)
 
-    needed_skus = set(shortlist_by_query.keys())
-    for cand_list in shortlist_by_query.values():
-        needed_skus.update(cand_list)
-    multi_cache = load_or_build_multi(
-        multi_path,
-        model,
-        sorted(needed_skus),
-        source_indexed,
-        images_dir,
-        tokenizers,
-        transform,
-        batch_size,
-        device,
-        title_vectors,
-        desc_vectors,
-        image_vectors,
-        force=args.force_recompute,
-    )
+                idx_in_catalog = [catalog_skus.index(sku) for sku in ranked]
+                idx_t = torch.tensor(idx_in_catalog, device=device)
+                q = multi_cache[query_sku]
+                scores = _normalized_colbert_pair_scores(
+                    model, q,
+                    d_name.index_select(0, idx_t),
+                    d_desc.index_select(0, idx_t),
+                    d_img.index_select(0, idx_t),
+                    title_vectors, desc_vectors, image_vectors,
+                )
+                order = torch.argsort(scores, descending=True).tolist()
+                reranked = [ranked[i] for i in order]
+                _metric_update(rerank_acc, reranked, relevant, ks)
 
-    with torch.no_grad():
-        for query_sku, candidates in tqdm(shortlist_by_query.items(), desc="stage2_rerank"):
-            if query_sku not in multi_cache:
-                continue
-            available = [sku for sku in candidates if sku in multi_cache]
-            if not available:
-                continue
-            q = multi_cache[query_sku]
-            d_name = torch.stack([multi_cache[sku]["name"] for sku in available]).to(device)
-            d_desc = torch.stack([multi_cache[sku]["desc"] for sku in available]).to(device)
-            d_img = torch.stack([multi_cache[sku]["img"] for sku in available]).to(device)
-            scores = _normalized_colbert_scores(
-                model,
-                q,
-                d_name,
-                d_desc,
-                d_img,
-                title_vectors,
-                desc_vectors,
-                image_vectors,
-            )
-            order = torch.argsort(scores, descending=True).tolist()
-            reranked = [available[i] for i in order]
-            _metric_update(rerank_acc, reranked, relevant_by_query[query_sku], ks)
-
-    rerank_metrics = _metric_finalize(rerank_acc, ks)
+    stage1_metrics = _metric_finalize(stage1_acc, ks)
+    rerank_metrics = _metric_finalize(rerank_acc, ks) if not is_colbert_trained else {}
 
     with mlflow.start_run(run_id=args.mlflow_run_id):
         mlflow.log_params(
@@ -270,10 +280,14 @@ def main():
                 "colbert_image_vectors": image_vectors,
             }
         )
-        for metric_name, value in baseline_metrics.items():
-            mlflow.log_metric(f"test_full/{metric_name}", value)
-        for metric_name, value in rerank_metrics.items():
-            mlflow.log_metric(f"test_full/{metric_name}_colbert", value)
+        if is_colbert_trained:
+            for metric_name, value in stage1_metrics.items():
+                mlflow.log_metric(f"test_full/{metric_name}_colbert", value)
+        else:
+            for metric_name, value in stage1_metrics.items():
+                mlflow.log_metric(f"test_full/{metric_name}", value)
+            for metric_name, value in rerank_metrics.items():
+                mlflow.log_metric(f"test_full/{metric_name}_colbert_rerank", value)
 
 
 if __name__ == "__main__":

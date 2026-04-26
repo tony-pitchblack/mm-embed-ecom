@@ -10,7 +10,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.siamese_clip import Tokenizers, get_transform
-from models.siamese_clip_colbert import SiameseRuCLIPColBERT
+from models.siamese_clip_colbert import SiameseRuCLIPColBERT, SiameseRuCLIPColBERTWithHead
 
 CACHE_ROOT = Path("data/cache/embeddings")
 
@@ -35,7 +35,7 @@ def _results_dir_for_preload(cfg: dict) -> Optional[str]:
 
 def build_siamese_colbert(
     train_cfg: dict, device: str, checkpoint_path: str
-) -> SiameseRuCLIPColBERT:
+) -> SiameseRuCLIPColBERTWithHead:
     proj_dim = int(train_cfg.get("proj_dim", 128))
     use_ph = bool(train_cfg.get("use_projection_heads", True))
     fp = train_cfg.get("freeze_patterns")
@@ -45,7 +45,9 @@ def build_siamese_colbert(
     if isinstance(up, str):
         up = None
     m_dir = _results_dir_for_preload(train_cfg) if train_cfg.get("preload_model_name") else None
-    model = SiameseRuCLIPColBERT(
+    mkey = str(train_cfg.get("model", "siamese_clip"))
+    cls = SiameseRuCLIPColBERT if mkey == "siamese_clip_colbert" else SiameseRuCLIPColBERTWithHead
+    model = cls(
         device=device,
         name_model_name=train_cfg["name_model_name"],
         description_model_name=train_cfg["description_model_name"],
@@ -57,13 +59,11 @@ def build_siamese_colbert(
         freeze_patterns=fp,
         unfreeze_patterns=up,
     )
-    mkey = str(train_cfg.get("model", "siamese_clip"))
-    strict = mkey == "siamese_clip_colbert" and use_ph
     sd = torch.load(checkpoint_path, map_location=torch.device(device), weights_only=True)
-    res = model.load_state_dict(sd, strict=strict)
-    if not strict and (res.missing_keys or res.unexpected_keys):
+    res = model.load_state_dict(sd, strict=False)
+    if res.missing_keys or res.unexpected_keys:
         warnings.warn(
-            f"load_state_dict strict=False: "
+            f"load_state_dict strict=False ({cls.__name__}): "
             f"missing={len(res.missing_keys)} unexpected={len(res.unexpected_keys)}",
             stacklevel=2,
         )
