@@ -1,14 +1,14 @@
 series:
-  - name: "Siamese Bi-Encoder"
+  - name: "Bi-Encoder"
     run_id: c721ad0478c34956b3221723d63167c9
     mode: stage1
     color: "#1f77b4"
-  - name: "Siamese Bi-Encoder w/ ColBERT reranking"
+  - name: "ColBERT rerank"
     run_id: c721ad0478c34956b3221723d63167c9
     mode: stage1_colbert_rerank
     color: "#ff7f0e"
-  - name: "Siamese Bi-Encoder w/ trained ColBERT embeddings"
-    run_id: cc1e6cc3a91e472495b8aa21039ba0e0
+  - name: "Trained ColBERT"
+    run_id: 270979da4551486ebca4d08852d41061
     mode: colbert
     color: "#2ca02c"
 title_vectors: 4
