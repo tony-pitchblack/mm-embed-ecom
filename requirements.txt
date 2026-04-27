@@ -5,6 +5,7 @@ transformers
 timm
 mlflow[mcp]>=3.5.1
 huggingface_hub
+hf_xet
 python-dotenv
 pandas
 pyarrow
